@@ -5,13 +5,16 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "build": "./build.sh",
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "assets": "./build.sh",
+    "build": "npm run assets && cf build",
+    "dev": "cf dev",
+    "deploy": "npm run assets && cf deploy",
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
+    "cf": "^1.0.0-rc.2",
     "typescript": "^7.0.2",
-    "wrangler": "^4.0.0"
+    "wrangler": "^4.166.0"
   },
   "dependencies": {
     "unkernel": "0.2.0-261121-e69adda"

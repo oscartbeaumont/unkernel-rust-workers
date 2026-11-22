@@ -3,5 +3,6 @@ assets/
 rust/target/
 *.log
 .wrangler/
+.cloudflare/
 .dev.vars*
 .env*

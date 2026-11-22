@@ -63,6 +63,12 @@ The two large files in `assets/` — `unkernel.wasm` (~10 MB) and
 `./build.sh`. The kernel comes from the published `unkernel` npm package;
 the binary is built in Docker from `rust/`.
 
+The Worker is configured as `cloudflare.config.ts` (`cf/config`) plus
+`wrangler.config.ts` (the Wrangler bundler holds the Data rule for the
+binary). The documented flow is `cf dev` / `cf build` / `cf deploy`;
+`wrangler dev` / `wrangler deploy` remain available for the parts that
+read the Wrangler config.
+
 ## Prerequisites
 
 - Node 24+
@@ -72,18 +78,22 @@ the binary is built in Docker from `rust/`.
 ## Build
 
 ```sh
-./build.sh
+npm run assets   # ./build.sh: npm install + kernel copy + Docker Rust build
+npm run build    # assets + cf build (wrangler under the hood)
 ```
 
-This installs dependencies, copies the published `unkernel.wasm` into
+`./build.sh` installs dependencies, copies the published `unkernel.wasm` into
 `assets/`, and builds the binary in `rust:1-alpine` for
-`aarch64-unknown-linux-musl` (static, stripped, LTO).
+`aarch64-unknown-linux-musl` (static, stripped, LTO). The build artifacts
+in `assets/` are gitignored; `npm run build` regenerates them and then
+builds the Worker bundle with `cf build`.
 
 ## Run locally
 
 ```sh
-npx wrangler dev
+npx cf dev
 ```
+
 
 then in another terminal:
 
@@ -102,13 +112,11 @@ milliseconds. The guest's boot log goes to the Worker logs.
 ## Deploy
 
 ```sh
-npx wrangler login   # once
-npx wrangler deploy
+npx cf auth login   # once
+npx cf deploy
 ```
 
-Requires `wrangler whoami` to succeed. The deploy uploads ~10 MB of wasm
-and ~1 MB of binary (within the Workers size limit); both are imported as
-additional modules, never served as static assets.
+Requires `npx cf auth whoami` to succeed. The deploy uploads ~11 MB of wasm and ~1 MB of binary (within the Workers size limit); both are imported as additional modules, never served as static assets.
 
 ## Notes and limitations
 
@@ -119,7 +127,7 @@ additional modules, never served as static assets.
   server are well within the 30 s per-request CPU budget.
 - Requests go through the guest's single-threaded TCP stack — this is a
   hello world, not a high-throughput service.
-- `compatibility_flags = ["no_handle_cross_request_promise_resolution"]`
+- `compatibilityFlags: ["no_handle_cross_request_promise_resolution"]`
   is required: the kernel's promise chains (JSPI wakeups) must resolve
   across requests, not only inside the request that created them.
 - The guest runs the usual unkernel limitations (e.g. no SMP, no inbound
