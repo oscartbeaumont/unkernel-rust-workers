@@ -1,4 +1,4 @@
-// The wrangler-bundled modules the Worker imports (see wrangler.toml).
+// The wrangler-bundled modules the Worker imports (see wrangler.config.ts).
 declare module "*.wasm" {
   const module: WebAssembly.Module;
   export default module;

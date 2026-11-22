@@ -1,13 +1,13 @@
 //! A tiny Axum hello world that runs in the unkernel guest.
 //!
-//! The guest is a real aarch64 Linux userland (Alpine-flavored); this binary is
-//! built as a fully static musl executable and runs under the base system's
-//! init without any distro. It binds loopback port 3000, which the Worker reaches
-//! through the kernel's vm.fetch().
+//! The binary is built as a fully static musl executable for the guest's own
+//! init (guest/init/init.c) and is packed into the kernel's initrd. It binds
+//! loopback port 3000, which the Worker reaches through the kernel's
+//! vm.fetch().
 
 use axum::{Router, routing::{get, post}};
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     let app = Router::new()
         .route("/", get(hello))

@@ -20,80 +20,113 @@ host.
 
 ```
 request ──► worker (Cloudflare Workers, TS)
-                 │   lazy boot (first request per isolate)
+                 │   boot on the first request of the isolate
                  ▼
-           unkernel kernel (WebAssembly, ~10 MB)
-                 │   base shell (busybox + kw tools), no distro download
+           unkernel kernel (WebAssembly, 6.4 MB)
+                 │   init → kwtty, no busybox, no distro
                  ▼
-           axum-hello (aarch64 musl binary, ~1 MB, mounted read-only)
+           axum-hello (aarch64 musl binary, 790 KB, packed in the initrd)
                  │
                  └─ 127.0.0.1:3000 ──► vm.fetch() ──► HTTP response
 ```
 
-- The kernel is loaded from `assets/unkernel.wasm` — the same file the
-  published `unkernel` npm package ships — imported as a wrangler-bundled
-  `CompiledWasm` module (Workers disallows runtime wasm compilation, so no
-  bytes are compiled in production).
-- The binary is imported as a wrangler `Data` module, written into a
-  read-only in-memory filesystem in the guest, and spawned with the SDK.
+- The kernel is loaded from `assets/unkernel.wasm`, imported as a
+  wrangler-bundled `CompiledWasm` module (Workers disallows runtime wasm
+  compilation, so no bytes are compiled in production).
+- The guest binary is packed into the kernel's initrd by
+  `scripts/kernel-prep.mjs`, so there is no data module and no 9p mount:
+  the isolate boots the kernel and execs the server.
 - Requests are forwarded with `vm.fetch()` (HTTP/1.1 over vsock), so the
   guest sees a normal localhost TCP connection. No network backends, no
   specialist host software: everything runs inside one isolate.
 
 Because Workers disallows dynamic wasm compilation, the kernel's JIT is
-disabled (`jit: false`); the guest interpreter is enough for a hello
-world, and the kernel log stays clean.
+disabled (`jit: false`); the interpreter is enough for a hello world, and the
+kernel log stays clean. (Measured in Node, where the JIT is allowed: it is
+not faster for these routes — `/health` 0.58 ms with the JIT vs 0.51 ms
+without, `POST /echo` ~8% slower with it. `scripts/jit-ab.mjs` reproduces
+that.)
+
+## Bundle size
+
+The deployed bundle is one wasm module (~6.4 MB) plus the Worker script
+(~0.5 MB). `./build.sh` gets it there from the stock 10.2 MB kernel:
+
+| step | bytes |
+| --- | --- |
+| stock `unkernel.wasm` from the npm package | 10,165,321 |
+| drop unused sections (`name`, `producers`, the SMP patch, the data disk) | |
+| keep only the exports the SDK reads (the other 11k are a symbol table) | 8,500,796 |
+| build the initrd from init + kwtty + the server (no busybox base image) | |
+| `wasm-opt -Oz --closed-world --remove-unused-module-elements` | 6,744,890 |
+
+That is **9.03 MB → 7.08 MB (−21.6%)** for the upload (`cf deploy --dry-run`:
+7,078 KiB raw, 2,690 KiB gzip), and **11.55 MB → 7.08 MB (−39%)** from the
+first deployment. Boot time (local `cf dev`, `scripts/bench.mjs --cold`):
+~320 ms → ~170 ms.
+
+Two things are deliberately *not* in the bundle:
+
+- **An AOT replacement for the JIT.** The JIT emits wasm modules at runtime,
+  which Workers forbids; the natural workaround is to capture them offline
+  and ship them. That does not survive measurement: the emitted bytes embed
+  run-specific block offsets (five captures of the same workload gave 5, 3,
+  1, 1 and 3 modules with different hashes), the Worker boots a different
+  kernel instantiation anyway, and the JIT is slower than the interpreter
+  for these routes. `scripts/jit-capture-20.mjs` is the capture tool and
+  documents the evidence.
+- **Eager boot at module scope.** Workerd refuses async work, timers and
+  random values in global scope, and the kernel needs `random_get()` to
+  boot, so an isolate cannot start the VM until a request handler runs. What
+  *is* available — a 2 ms → 100 ms backoff on the readiness probe instead of
+  a fixed 150 ms poll — is in `worker/index.ts`.
 
 ## Repo layout
 
 ```
 worker/
   index.ts         the Worker: boots the kernel once, proxies requests
-  assets.d.ts      types for the wrangler-bundled .wasm / .bin imports
+  assets.d.ts      types for the wrangler-bundled .wasm import
 rust/
   Cargo.toml       "unkernel-axum" crate
   src/main.rs      the Axum hello world
-build.sh           npm install + kernel copy + Docker Rust build
-wrangler.toml      the Worker config (Data rule for the binary)
-.github/
+guest/init/
+  init.c           the guest init: mounts, loopback, kwtty, reaping
+scripts/
+  kernel-prep.mjs  sections, exports and initrd for the deployed kernel
+  bench.mjs        cold/warm benchmark (spawns `cf dev`)
+  jit-capture-20.mjs, jit-ab.mjs  the AOT-JIT investigation (not in the build)
+build.sh           npm install + Docker guest build + kernel prep + wasm-opt
+cloudflare.config.ts  the Worker (name, entrypoint, compat flags)
+wrangler.config.ts    the bundler (minified, no source maps)
 ```
 
-The two large files in `assets/` — `unkernel.wasm` (~10 MB) and
-`axum-hello.bin` (~1 MB) — are build artifacts (gitignored) produced by
-`./build.sh`. The kernel comes from the published `unkernel` npm package;
-the binary is built in Docker from `rust/`.
-
-The Worker is configured as `cloudflare.config.ts` (`cf/config`) plus
-`wrangler.config.ts` (the Wrangler bundler holds the Data rule for the
-binary). The documented flow is `cf dev` / `cf build` / `cf deploy`;
-`wrangler dev` / `wrangler deploy` remain available for the parts that
-read the Wrangler config.
+The large files in `assets/` are build artifacts (gitignored) produced by
+`./build.sh`.
 
 ## Prerequisites
 
 - Node 24+
 - Docker (with the `linux/arm64` platform)
+- [binaryen](https://github.com/WebAssembly/binaryen) (`brew install binaryen`)
 - A Cloudflare account for deploy (optional for local dev)
 
 ## Build
 
 ```sh
-npm run assets   # ./build.sh: npm install + kernel copy + Docker Rust build
-npm run build    # assets + cf build (wrangler under the hood)
+./build.sh       # guest binaries (Docker) + kernel prep + wasm-opt
+npm run build    # ./build.sh + cf build (wrangler under the hood)
 ```
 
-`./build.sh` installs dependencies, copies the published `unkernel.wasm` into
-`assets/`, and builds the binary in `rust:1-alpine` for
-`aarch64-unknown-linux-musl` (static, stripped, LTO). The build artifacts
-in `assets/` are gitignored; `npm run build` regenerates them and then
-builds the Worker bundle with `cf build`.
+`./build.sh` builds the Axum server and the guest init in `rust:1-alpine` for
+`aarch64-unknown-linux-musl` (static, stripped, LTO), then prepares the kernel
+and optimizes it with `wasm-opt`. The artifacts in `assets/` are gitignored.
 
 ## Run locally
 
 ```sh
 npx cf dev
 ```
-
 
 then in another terminal:
 
@@ -106,7 +139,7 @@ curl -X POST --data 'hi' http://localhost:8787/echo
 # hi
 ```
 
-The first request boots the kernel (~0.3 s). Requests after that are a few
+The first request boots the kernel (~0.2 s). Requests after that are a few
 milliseconds. The guest's boot log goes to the Worker logs.
 
 ## Deploy
@@ -116,15 +149,18 @@ npx cf auth login   # once
 npx cf deploy
 ```
 
-Requires `npx cf auth whoami` to succeed. The deploy uploads ~11 MB of wasm and ~1 MB of binary (within the Workers size limit); both are imported as additional modules, never served as static assets.
+The deploy uploads ~7 MB of wasm and ~0.5 MB of script (within the Workers
+size limit); the kernel is an imported module, never served as a static asset.
 
 ## Notes and limitations
 
-- One kernel per isolate, booted lazily on the first request. After the
-  isolate is evicted, the next request boots a fresh one.
-- The guest runs on the tree-shaken interpreter (`jit: false`), since
-  Workers does not allow dynamic wasm compilation. Startup and the axum
-  server are well within the 30 s per-request CPU budget.
+- One kernel per isolate, booted on the first request. After the isolate is
+  evicted, the next request boots a fresh one.
+- The guest image has no shell (`vm.exec()` would fail); the Worker only
+  needs `createKernel`, `spawn`, `connect` and `fetch`.
+- The guest runs on the interpreter (`jit: false`), since Workers does not
+  allow dynamic wasm compilation. Startup and the axum server are well
+  within the 30 s per-request CPU budget.
 - Requests go through the guest's single-threaded TCP stack — this is a
   hello world, not a high-throughput service.
 - `compatibilityFlags: ["no_handle_cross_request_promise_resolution"]`
@@ -135,7 +171,7 @@ Requires `npx cf auth whoami` to succeed. The deploy uploads ~11 MB of wasm and 
 
 ## Licenses
 
-- `worker/`, `rust/`, `build.sh`, `wrangler.toml`: MIT (same as the
+- `worker/`, `rust/`, `guest/`, `scripts/`, `build.sh`: MIT (same as the
   unkernel SDK)
 - `assets/unkernel.wasm`: Linux kernel + unkernel guest, GPL-2.0-only /
   MIT mix — see https://github.com/pithings/unkernel for the full text

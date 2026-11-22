@@ -6,3 +6,4 @@ rust/target/
 .cloudflare/
 .dev.vars*
 .env*
+guest/init/target/

@@ -10,11 +10,12 @@ path = "src/main.rs"
 
 [dependencies]
 axum = "0.8"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+tokio = { version = "1", features = ["macros", "rt", "net"] }
 
 [profile.release]
 debug = false
 lto = true
 codegen-units = 1
 strip = true
-opt-level = 2
+opt-level = 3
+panic = "abort"
