@@ -49,21 +49,26 @@ that.)
 
 ## Bundle size
 
-The deployed bundle is one wasm module (~6.4 MB) plus the Worker script
-(~0.5 MB). `./build.sh` gets it there from the stock 10.2 MB kernel:
+The deployed bundle is one wasm module (6.4 MB) plus the Worker script
+(0.2 MB). `./build.sh` gets the kernel there from the stock 10.2 MB one:
 
 | step | bytes |
 | --- | --- |
 | stock `unkernel.wasm` from the npm package | 10,165,321 |
 | drop unused sections (`name`, `producers`, the SMP patch, the data disk) | |
-| keep only the exports the SDK reads (the other 11k are a symbol table) | 8,500,796 |
-| build the initrd from init + kwtty + the server (no busybox base image) | |
+| keep only the exports the SDK reads (the other 11k are a symbol table) | |
+| build the initrd from init + kwtty + the server (no busybox base image) | 7,723,325 |
 | `wasm-opt -Oz --closed-world --remove-unused-module-elements` | 6,744,890 |
 
-That is **9.03 MB → 7.08 MB (−21.6%)** for the upload (`cf deploy --dry-run`:
-7,078 KiB raw, 2,690 KiB gzip), and **11.55 MB → 7.08 MB (−39%)** from the
-first deployment. Boot time (local `cf dev`, `scripts/bench.mjs --cold`):
-~320 ms → ~170 ms.
+The Worker script also lost the SDK's browser page (`unkernel/web` pulls in
+display, downloads, IndexedDB, HTTP disks and a WASI worker): `worker/kernel.ts`
+calls the same factory it does with the platform a Worker actually has, which
+takes it from 503 KB to 205 KB.
+
+In total: **9.03 MB → 6.79 MB for the upload (−25%)**, and 11.55 MB → 6.79 MB
+(−41%) from the first deployment (`cf deploy --dry-run`: 6,787 KiB raw,
+2,593 KiB gzip). Boot (local `cf dev`, `scripts/bench.mjs --cold`): ~320 ms →
+~170 ms; warm `GET /health` p50 ~2 ms.
 
 Two things are deliberately *not* in the bundle:
 
@@ -86,6 +91,7 @@ Two things are deliberately *not* in the bundle:
 ```
 worker/
   index.ts         the Worker: boots the kernel once, proxies requests
+  kernel.ts        createKernel without the SDK's browser page (205 KB less)
   assets.d.ts      types for the wrangler-bundled .wasm import
 rust/
   Cargo.toml       "unkernel-axum" crate
@@ -149,7 +155,7 @@ npx cf auth login   # once
 npx cf deploy
 ```
 
-The deploy uploads ~7 MB of wasm and ~0.5 MB of script (within the Workers
+The deploy uploads ~6.4 MB of wasm and ~0.2 MB of script (within the Workers
 size limit); the kernel is an imported module, never served as a static asset.
 
 ## Notes and limitations

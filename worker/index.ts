@@ -14,9 +14,8 @@
  * an isolate cannot start the VM until a handler is running.
  */
 
-import { createKernel } from "unkernel/web";
+import { createKernel } from "./kernel";
 import type { KernelInstance } from "unkernel/web";
-import kernelWasm from "../assets/unkernel.wasm";
 
 /** Where scripts/kernel-prep.mjs packs the binary into the guest's initrd. */
 const GUEST_FILE = "/hello/axum-hello";
@@ -53,12 +52,7 @@ async function boot(): Promise<KernelInstance> {
     // The guest runs on the interpreter: Cloudflare Workers disallows dynamic
     // wasm compilation (jit), so the kernel's JIT is disabled and the kernel
     // log stays clean.
-    vm = await createKernel({
-      kernel: kernelWasm,
-      jit: false,
-      memoryMiB: 64,
-      memoryFallbackMiB: [48, 32],
-    });
+    vm = await createKernel({ jit: false });
 
     // The guest's console goes to the worker logs; it is the boot log plus
     // whatever the server writes (bounded by drain()).
