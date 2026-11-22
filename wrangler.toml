@@ -1,0 +1,17 @@
+name = "unkernel-rs"
+main = "worker/index.ts"
+compatibility_date = "2026-11-17"
+
+# The kernel is a long-lived, isolate-global runtime: its internal promise
+# chains (JSPI, wakeups, vsock) must resolve across requests, not just inside
+# the request that created them. Without this flag the Workers runtime cancels
+# those continuations once the request that created them ends.
+compatibility_flags = ["no_handle_cross_request_promise_resolution"]
+
+# The binary is imported as a "Data" module below; the default rule handles
+# the .wasm kernel. Anything under the repo root that matches these globs is
+# uploaded as an additional module (not served).
+[[rules]]
+type = "Data"
+globs = ["assets/*.bin"]
+fallthrough = true

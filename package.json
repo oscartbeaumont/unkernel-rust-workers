@@ -1,0 +1,19 @@
+{
+  "name": "unkernel-rs",
+  "version": "0.1.0",
+  "description": "A Rust + Axum hello world in Cloudflare Workers, running inside a Linux kernel compiled to WebAssembly (unkernel)",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "./build.sh",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2",
+    "wrangler": "^4.0.0"
+  },
+  "dependencies": {
+    "unkernel": "0.2.0-261121-e69adda"
+  }
+}

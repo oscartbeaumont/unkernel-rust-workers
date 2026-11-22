@@ -1,0 +1,20 @@
+[package]
+name = "unkernel-axum"
+version = "0.1.0"
+edition = "2021"
+description = "A tiny Axum hello world: the guest program for unkernel-rs"
+
+[[bin]]
+name = "axum-hello"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+
+[profile.release]
+debug = false
+lto = true
+codegen-units = 1
+strip = true
+opt-level = 2

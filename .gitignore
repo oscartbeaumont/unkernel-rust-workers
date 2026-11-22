@@ -1,0 +1,7 @@
+node_modules/
+assets/
+rust/target/
+*.log
+.wrangler/
+.dev.vars*
+.env*
