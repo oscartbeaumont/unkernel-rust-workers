@@ -7,7 +7,7 @@
   "scripts": {
     "assets": "./build.sh",
     "build": "npm run assets && cf build",
-    "dev": "cf dev",
+    "dev": "node scripts/patch-sdk.mjs && cf dev",
     "deploy": "npm run assets && cf deploy",
     "typecheck": "tsc --noEmit"
   },

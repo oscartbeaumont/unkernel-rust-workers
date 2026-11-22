@@ -25,6 +25,9 @@ cd "$(dirname "$0")"
 echo "==> installing npm dependencies"
 npm install --no-audit --no-fund
 
+echo "==> patching the SDK's kwtty retry (100 ms -> 5 ms)"
+node scripts/patch-sdk.mjs
+
 echo "==> copying the kernel from the published unkernel package"
 mkdir -p assets
 cp node_modules/unkernel/dist/unkernel.wasm assets/unkernel.src.wasm

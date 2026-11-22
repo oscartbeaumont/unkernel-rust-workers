@@ -68,7 +68,13 @@ takes it from 503 KB to 205 KB.
 In total: **9.03 MB → 6.79 MB for the upload (−25%)**, and 11.55 MB → 6.79 MB
 (−41%) from the first deployment (`cf deploy --dry-run`: 6,787 KiB raw,
 2,593 KiB gzip). Boot (local `cf dev`, `scripts/bench.mjs --cold`): ~320 ms →
-~170 ms; warm `GET /health` p50 ~2 ms.
+~85 ms; warm `GET /health` p50 ~2 ms.
+
+Half of the remaining boot is a plain SDK bug worth knowing about: the
+terminal client retries a refused kwtty connection every 100 ms, so the first
+spawn (issued while the guest is still booting) throws away most of a poll
+interval. `scripts/patch-sdk.mjs` retries every 5 ms instead — that alone is
+~85 ms of the cold start.
 
 Two things are deliberately *not* in the bundle:
 
@@ -100,6 +106,7 @@ guest/init/
   init.c           the guest init: mounts, loopback, kwtty, reaping
 scripts/
   kernel-prep.mjs  sections, exports and initrd for the deployed kernel
+  patch-sdk.mjs    the kwtty retry interval (100 ms -> 5 ms)
   bench.mjs        cold/warm benchmark (spawns `cf dev`)
   jit-capture-20.mjs, jit-ab.mjs  the AOT-JIT investigation (not in the build)
 build.sh           npm install + Docker guest build + kernel prep + wasm-opt
@@ -145,7 +152,7 @@ curl -X POST --data 'hi' http://localhost:8787/echo
 # hi
 ```
 
-The first request boots the kernel (~0.2 s). Requests after that are a few
+The first request boots the kernel (~0.09 s). Requests after that are a few
 milliseconds. The guest's boot log goes to the Worker logs.
 
 ## Deploy
