@@ -7,268 +7,233 @@
 > runtime, builds the kernel from a pinned fork commit, and adds the Rust +
 > Axum guest, the guest init and the Cloudflare Worker around it.
 
-A Rust + Axum hello world running in Cloudflare Workers — as a real Linux
-process, not as a wasm binary.
+A real Rust + Axum server running inside a Linux kernel compiled to
+WebAssembly, in a Cloudflare Worker. The app is an ordinary
+`aarch64-unknown-linux-musl` binary: nothing in it knows about Workers, wasm
+or the edge.
 
-The Axum server is a fully static `aarch64-unknown-linux-musl` executable
-that runs inside a real Linux kernel compiled to WebAssembly
-([unkernel](https://github.com/pithings/unkernel), a Linux 7.x build with a
-real MMU). The kernel and the binary are loaded by the Worker, the kernel
-boots once per isolate, and every request is proxied to the guest's
-loopback port 3000 over the kernel's vsock channel.
+**Live:** https://unkernel-rs.oscartbeaumont.workers.dev
 
-This is the point of the project: **the app needs no WASM support for Tokio
-or Axum**. The kernel is a native wasm module that Cloudflare Workers is
-allowed to run (it is bundled, not compiled at runtime), and the app is an
-unmodified aarch64 Linux binary that runs exactly as it would on a Linux
-host.
+```sh
+curl https://unkernel-rs.oscartbeaumont.workers.dev/health
+# ok
+```
+
+## Why this exists
+
+Workers run JavaScript and WebAssembly. Most services are neither: they are
+normal Linux programs built on Tokio, Hyper, threads, `epoll`, files and TCP.
+Porting one to `wasm32-unknown-unknown` is a rewrite: the OS disappears, and
+its pieces have to be rebuilt.
+
+This project takes the other route: the wasm module is **Linux itself**. The
+kernel boots in the isolate, the unmodified server runs inside it, and the
+Worker forwards HTTP to the server's loopback port. The app crosses no wasm
+boundary; the kernel does.
+
+What that buys:
+
+- **Any static Linux binary runs.** No wasm build, no Tokio/Axum shims, no
+  `cfg(target_arch = "wasm32")` in the app.
+- **Real Linux behaviour.** `epoll`, `futex`, threads, `/proc`, `/dev`, TCP
+  loopback and ELF loading are the kernel's own, not a reimplementation.
+- **One boot per isolate.** The kernel takes ~60–85 ms to come up, then
+  requests take milliseconds.
+- **Small enough to ship.** 3.49 MB raw / 1.58 MB gzip in one bundle, down
+  from 11.55 MB.
+- **Self-contained.** No external VMs, containers or network backends: the
+  Worker, the kernel and the app are the whole system.
+
+The honest costs are in [Limits](#limits): one CPU, one VM, no inbound network,
+and an interpreted guest.
 
 ## How it works
 
 ```
-request ──► worker (Cloudflare Workers, TS)
-                 │   boot on the first request of the isolate
-                 ▼
-           unkernel kernel (WebAssembly, 3.52 MB, built from the fork)
-                 │   init → kwtty, no busybox, no distro
-                 ▼
-           axum-hello (aarch64 musl binary, 790 KB, packed in the initrd)
-                 │
-                 └─ 127.0.0.1:3000 ──► vm.fetch() ──► HTTP response
+client ──► Worker (TypeScript, one isolate)
+              │  first request: boot the kernel once
+              ▼
+        Linux kernel (WebAssembly)
+              │  initrd: /init, kwtty, /hello/axum-hello
+              ▼
+        axum-hello (aarch64 musl, unmodified)
+              │
+              └─ 127.0.0.1:3000 ◄── vm.fetch() ── HTTP/1.1 over vsock
 ```
 
-- The kernel is loaded from `assets/unkernel.wasm`, imported as a
-  wrangler-bundled `CompiledWasm` module (Workers disallows runtime wasm
-  compilation, so no bytes are compiled in production). It is built from
-  the unkernel fork with the JIT tier and most of the kernel's features
-  turned off (see below).
-- The guest binary is packed into the kernel's initrd by
-  `scripts/kernel-prep.mjs`, so there is no data module and no 9p mount:
-  the isolate boots the kernel and execs the server.
-- Requests are forwarded with `vm.fetch()` (HTTP/1.1 over vsock), so the
-  guest sees a normal localhost TCP connection. No network backends, no
-  specialist host software: everything runs inside one isolate.
-- The Worker runs a forked host runtime (`sdk/`): the kernel's WASI clock,
-  randomness, console, task switching and vsock/kwtty/HTTP path, and
-  nothing else (no display, sound, input, disks, network stack, mounts,
-  snapshots, profiler or JIT hosts).
+1. The first request boots the kernel. It cannot happen at module scope:
+   Workers forbids async work, timers and random values there, and the kernel
+   needs `random_get()` to boot.
+2. The kernel mounts a tiny initrd, brings up loopback, and starts the server
+   through kwtty.
+3. Each Worker request opens an HTTP/1.1 connection to the guest's loopback
+   port and returns the guest's response.
+4. Every request in the isolate shares that one VM (see
+   [Concurrency](#concurrency)).
 
-## Bundle size and startup
+### The kernel
 
-The deployed bundle is one wasm module (3.52 MB) plus the Worker script
-(56 KB): **3,490 KiB raw / 1,583 KiB gzip** (`cf deploy --dry-run`).
+The kernel is unkernel's Linux 7.x port, rebuilt from a pinned fork commit
+with `KWEMU_JIT=0`, `KW_SMP=0` and a config fragment
+(`kernel/kw_worker.config`) that keeps only what this app uses.
 
-| step | bytes |
-| --- | --- |
-| stock `unkernel.wasm` from the npm package | 10,165,321 |
-| kernel fork: `KWEMU_JIT=0`, `-Os`, a 16 KiB printk ring, and a config trimmed to this app | 4,969,494 (bundled) |
-| drop sections it never reads, keep only the 9 exports the host uses, and build the initrd from init + kwtty + the server (no busybox base image) | 4,159,756 |
-| `wasm-opt -Oz --closed-world --remove-unused-module-elements` | 3,517,686 |
-| Worker script: the forked host instead of the SDK | 59,320 |
+Kept: MMU, ELF loading, TCP loopback, vsock, pty, `proc`/`sys`/`devtmpfs`/
+`tmpfs`. Removed: cgroups, namespaces, POSIX IPC, the block layer, ext4,
+erofs, 9p, packet sockets, virtio, display, sound, input, modules, BTF and
+debug info.
 
-That is **6.79 MB → 3.49 MB (−49%)** for this round and **11.55 MB →
-3.49 MB (−70%)** from the first deployment. Boot (local `cf dev`,
-`scripts/bench.mjs --cold`): **~320 ms → ~60–70 ms** (median); warm `GET /health`
-p50 **~1.7 ms**, p99 ~7 ms (400 sequential, no stalls). Concurrent requests
-share the one VM through batched turns (see [Concurrency](#concurrency)).
+The guest userland is `/init` (mounts, loopback, kwtty, reaping) plus the
+server. There is no busybox and no distro by default.
 
-### The specialized kernel
+### The host runtime (`sdk/`)
 
-The kernel is rebuilt from the fork (`KWEMU_JIT=0`, `KW_SMP=0` and a config
-fragment on top of `kw_defconfig`). What that buys, measured on the same
-tree and toolchain:
+`unkernel/web` is the browser page API: display, downloads, IndexedDB, HTTP
+disk images, every device host. The fork in `sdk/` keeps only what a Worker
+needs: WASI clocks and randomness, console, task switching, vsock, kwtty and
+HTTP/1.1. Every removed device import is answered the way unkernel's disabled
+hosts answer it (`-ENODEV` or a benign 0), so the guest registers no device and
+never calls them.
 
-- the kwemu JIT tier: **317 KB** (the Worker can never call it);
-- the kernel config: **2.27 MB** — no cgroups/namespaces/POSIX IPC, no block
-  layer, ext4 or erofs, no 9p, no AF_UNIX, no packet sockets, no virtio,
-  display, sound or input, no modules, BTF or debug info. The guest is
-  `/init` → devtmpfs/proc/sysfs/tmpfs + loopback, `/usr/bin/kwtty`, and the
-  server; nothing else exists;
-- `CONFIG_BLOCK=n` alone is another **202 KB**.
+The script went from ~205 KB to ~59 KB, and the isolate has nothing to
+construct at boot.
 
-`KWVIRTIO=n` is not optional with the pinned SDK: the fork's defconfig kernel
-imports `unkernel.wasm_driver_virtio_*`, which the SDK does not provide, and
-the kernel traps on the first call.
+### The Worker (`worker/index.ts`)
 
-Build it with `npm run kernel` (`kernel/build-kernel.sh`): Docker only —
-Ubuntu 26.04 with clang/lld 22, Zig 0.16 from ziglang.org, and unkernel's own
-`kernel/build.sh` builds the patched `wasm-ld` from LLVM 22 on the first run
-(the LLVM build dominates: 10–60 minutes depending on the machine; ~8 s after
-that, since the toolchain, the checkout and the kernel build live in a Docker
-volume). It pins `pithings/unkernel@2abdc598e2d08c2a4d673254ae4581703d33a7a8`
-and writes the bundled kernel (vmlinux32 + the package's base initrd +
-cmdline, 6,069,048 B) to `assets/unkernel.fork.wasm`. The config fragment is
-`kernel/kw_worker.config`.
+It boots the kernel once, queues requests, drives the guest, bounds a guest
+that stops answering (3 s to first byte, then recycle and replay once), and
+adds `Server-Timing` headers.
 
-A rebuild reproduces the kernel's size and config, not necessarily its bytes:
-the shipped bundle is the recipe's output (`sha256 0a4705…`), and an
-independent build here came out byte-different with the same size and config
-(codegen depends on the exact LLVM patch release that apt's `clang-22`
-resolves to).
+## Concurrency
 
-`./build.sh` uses `assets/unkernel.fork.wasm` when it is present and the
-published package's kernel otherwise (`KERNEL=path` overrides both).
+One VM per isolate, one boot. But only one **request context** at a time may
+drive it: the kernel is a single suspended wasm stack, and workerd ties the
+continuations that resume it to the request that created them. Two requests
+driving at once is not slow, it is invalid — workerd aborts the batch with
+*"Promise will never complete"*.
 
-### The Worker script
+So the unit of scheduling is a **turn**. The request at the head of the queue
+drives the VM; when it is a safe request (GET/HEAD/OPTIONS without a body) it
+runs up to 16 guest connections at once in its own context, buffers their
+responses (256 KiB each), and hands them to the waiting requests. The VM is
+released as soon as the turn's bodies are read, so a slow client no longer
+holds it while it reads.
 
-`unkernel/web` is the browser page API: it brings display, downloads,
-IndexedDB stores, HTTP disk images, a WASI worker and every device host. The
-fork in `sdk/` keeps the kernel's runtime (WASI clocks and randomness,
-console, task switching, vsock, kwtty, HTTP/1.1) and answers the other device
-imports like the SDK's *disabled* hosts do (`-ENODEV`, benign 0), so the guest
-registers no device and never reaches them. The script goes from 205 KB to
-~56 KB and the isolate has nothing to construct at boot.
+- POST/PUT/PATCH/DELETE keep the exclusive lane: an oversized response cannot
+  be replayed without duplicating the effect.
+- A safe response larger than the buffer cap is deferred to its own turn,
+  where it streams.
+- A large streamed body still holds the VM until the client is done. With one
+  VM there is no way to run two turns at once.
 
-### Startup
-
-Boot is `createKernel` (~15–25 ms, Linux itself), then `spawn` waits for the
-guest's kwtty, then the server binds (~7 ms). The Worker asks for the spawn
-while the guest is still booting, so the first connection is refused: the
-fork retries every 5 ms instead of the upstream 100 ms (`sdk/tty.ts`), which
-is ~85 ms of the cold start. The readiness probe backs off 2 → 100 ms instead
-of a fixed 150 ms poll.
-
-### Concurrency
-
-One VM is shared by every request in the isolate (one boot, not one VM per
-request), but only one *request context* at a time may drive it. The kernel is
-one suspended wasm stack, and workerd ties the continuations that resume it to
-the request that created them: with two requests driving, workerd aborts the
-batch with *"Promise will never complete"* as soon as a timer fires. The unit
-of scheduling is therefore a **turn**, not a request.
-
-A turn's driver is the request at the head of the queue. When that request is
-safe (GET/HEAD/OPTIONS without a body, so it can be retried), the driver runs
-up to 16 guest connections concurrently in its own context — what the guest's
-own async server does natively, and what workerd permits within one request.
-Responses up to 256 KiB are buffered, handed to their waiters as plain values,
-and the VM is released as soon as the last one is read: a slow client no
-longer keeps the VM while it reads. The requests behind the driver poll their
-own job with a short timer; they never await a promise that another request
-resolves, which workerd cancels.
-
-Unsafe methods (POST/PUT/PATCH/DELETE) keep the exclusive lane and are never
-batched, because a response too large to buffer cannot be replayed without
-duplicating the request's effect. A safe request whose response is too large
-is deferred to a turn of its own, where it streams. The same applies to the
-driver's own body: a small response is buffered, a large one streams and holds
-the VM until the client is done, which is the one remaining head-of-line case.
-
-Measured locally (`cf dev`, 800 requests each, `GET /health`, zero failures):
+Local `cf dev`, 800 requests each, `GET /health`, zero failures:
 
 | concurrency | p50 | p99 | max |
 | --- | --- | --- | --- |
-| 1 (sequential) | 1.7 ms | 7.3 ms | 22 ms |
+| 1 | 1.7 ms | 7.3 ms | 22 ms |
 | 8 | 7.1 ms | 15.6 ms | 22 ms |
 | 16 | 12.9 ms | 27.8 ms | 30 ms |
 | 32 | 23 ms | 47 ms | 48 ms |
 | 64 | 44 ms | 71 ms | 72 ms |
 
-The same runs with the previous per-request lease were 21 ms and 82 ms at
-8-deep and 32-deep, because every request paid a handoff (~1–2.5 ms) and no
-request could share a turn. 32 guest calls from one context take ~13 ms, so
-the guest is not the limit; the remaining cost is the interpreter and the
-per-turn poll, not the queue.
+The same runs with the old per-request lease were 21 ms and 82 ms at 8- and
+32-deep: every request paid a handoff, and no request could share a turn.
 
 Every response carries a standard `Server-Timing` header:
-`unkernel-queue` (time waiting for a turn), `unkernel-ttfb` (turn start to
-the guest's response head), `unkernel-body` (head to buffered body end) and
-`unkernel-batch` (how many requests that turn carried, as its description).
-Chrome's DevTools renders them under Network → Timing → Server Timing, and
-`PerformanceServerTiming` exposes them to code. At 400 requests, 8-deep,
-against the deployed Worker the first two were p99 **16 ms** and **0–5 ms**,
-while the client saw 63 ms p50: most of that is TLS/edge/client, not the VM.
+`unkernel-queue` (waiting for a turn), `unkernel-ttfb` (turn start to the
+guest's response head), `unkernel-body` (head to buffered body end) and
+`unkernel-batch` (requests in that turn). Chrome DevTools shows them under
+Network → Timing → Server Timing.
 
-A slow client on a buffered body no longer holds the VM, so a download only
-delays the requests behind it when it is larger than the buffer cap (it then
-streams from the turn that owns it). With one VM there is no way to run two
-turns at once; a second VM is the next step if that case matters.
+## Making it small and fast
 
-### Measured dead ends
+The deployed bundle is one wasm module plus the Worker script:
+**3,490 KiB raw / 1,583 KiB gzip**. It started at 11.55 MB.
 
-- **AOT replacement for the JIT (byte-keyed):** the JIT emits wasm modules at
-  runtime, which Workers forbids; capturing them offline and matching by
-  content hash does not work — the emitted bytes embed run-specific block
-  offsets (five captures of the same workload gave 5, 3, 1, 1 and 3 modules
-  with different hashes).
-- **AOT replacement (PC-keyed):** the fork emits single blocks, whose bytes
-  *are* boot-independent, and 44 captured blocks were shipped as bundled
-  modules and installed by guest PC with interpreter fallback. Measured in
-  Node and in workerd: **no gain**. kwemu's own JIT with the same codegen is
-  slower than the interpreter for these routes (0.865 vs 0.751 ms `/health`),
-  so removing compile cost only reaches parity (0.601 vs 0.615 ms paired
-  p50), and p99 got worse (6.5–7.9 ms vs 2.4–2.8 ms) from the per-instance
-  first call. Cold was 11 ms worse just for carrying the modules.
-- **Eager boot at module scope:** workerd refuses async work, timers and
-  random values in global scope, and the kernel needs `random_get()` to
-  boot — an isolate cannot start the VM until a request handler runs.
+| step | size |
+| --- | --- |
+| stock `unkernel.wasm` from the npm package | 10,165,321 B |
+| kernel rebuilt for this app | 4,969,494 B |
+| sections, exports and initrd trimmed | 4,159,756 B |
+| `wasm-opt -Oz --closed-world` | 3,517,686 B |
+| Worker script (forked host) | 59,320 B |
 
-### The other path: AOT (works, not shipped)
+What actually moved the needle:
 
-The kernel path is what this repo ships and what runs in production. The
-same binary can instead be **translated to wasm at build time**, dropping the
-kernel and kwemu entirely. That project lives in
-`~/gh/oscartbeaumont-labs/unkernel-aot` (aarch64 → wasm translator, Linux ABI
-shim, Worker harness) and it now runs this exact `axum-hello.bin` — musl,
-tokio, hyper and all — with no kernel and no interpreter:
+- **The JIT tier: 317 KB.** The Worker can never call kwemu's JIT, so it is
+  compiled out.
+- **The kernel config: 2.27 MB.** `CONFIG_BLOCK=n` alone is 202 KB; the rest
+  is the list above. The kernel is also built with `-Os` and a 16 KiB printk
+  ring instead of 128 KiB.
+- **The initrd.** No busybox, no distro: `init`, kwtty and the server.
+- **`wasm-opt`.** 4.16 MB → 3.52 MB after dropping sections the kernel never
+  reads and keeping only the 9 exports the host uses.
+- **A forked host runtime.** 205 KB → 59 KB, and nothing constructed at boot.
 
-| | kernel + kwemu (shipped) | AOT of this binary |
+Boot went from ~320 ms to ~60–70 ms. A big part of that was a fixed 100 ms
+retry in kwtty: the first connection races the guest, and the fork retries
+every 5 ms (`sdk/tty.ts`) instead. The readiness probe backs off 2 → 100 ms
+rather than polling at a fixed 150 ms.
+
+Things that did **not** work, so they are not here:
+
+- Replacing the JIT with AOT-compiled hot blocks (byte-keyed and PC-keyed).
+  Both reached parity at best and made p99 worse.
+- Booting at module scope. Workerd refuses it, and the kernel needs randomness.
+- The built-in `node:wasi`. It is an unimplemented stub in workerd;
+  `@cloudflare/workers-wasi` works but costs 167 KiB and is ~3× slower per
+  call, and it covers none of sockets, epoll or futex.
+
+## The AOT path
+
+The kernel path is what ships. The same binary can instead be **translated to
+wasm at build time**, dropping the kernel and kwemu entirely. A separate
+prototype (aarch64 → wasm translator, Linux ABI shim, Worker harness) runs
+this exact `axum-hello.bin` — musl, Tokio, Hyper and all — with no kernel and
+no interpreter:
+
+| | kernel + kwemu (shipped) | AOT prototype |
 | --- | --- | --- |
-| module | 3,517,686 B | 4,462,977 B → 3,318,937 B (wasm-opt) |
-| upload raw / gzip | 3,490 KiB / 1,583 KiB | 4,436 KiB / **1,344 KiB** |
-| boot to "listening" | ~65 ms | **~11 ms** (workerd, 200 boots; 6 ms Node) |
-| warm `/health` p50 / p99 | ~1.9 / ~2.8 ms | **0.86 / 2.64 ms** |
-| guest work per request | — | **~103 µs** |
-| correctness evidence | real Linux kernel | 19/19 differential guests byte-identical, 2,000 requests 0 failures |
-| body streaming | (whole request/response through vsock) | 64 KiB chunks both ways: a 64 MiB echo with 64 KiB buffered |
+| module | 3.52 MB | 3.32 MB after `wasm-opt` |
+| gzip | 1.58 MB | 1.14 MB |
+| boot to "listening" | ~60–85 ms | **~11 ms** |
+| warm `/health` p50 | 1.7 ms | **0.86 ms** |
+| app changes | none | none |
 
-Honest read: the win is **boot (~6×) and per-request p50 (~2×)**, plus a much
-smaller trusted computing base. It is **not** a raw-size win for a binary of
-this size (4.46 MB against 4.44 MB; gzip is 23% smaller), and p99 is unchanged
-because it is workerd's HTTP pipeline, not the guest. The AOT runtime is also
-narrower than a kernel: no threads (`clone` is `-ENOSYS`), a synthetic socket
-layer instead of TCP, a stub file system, and one request per connection. That
-is why it is not the default here yet: a binary is only runnable if it fits
-that shape (this one does), so this repo keeps the kernel as the general path
-and the fallback.
+The translator covers this binary completely: 162,759 instructions and 41,801
+basic blocks, with no unsupported operations, and a differential corpus of 19
+guests came out byte-identical. Raw size is roughly a wash (3.32 MB against
+3.52 MB; gzip is ~28% smaller), but the real wins are boot (~6×) and p50
+(~2×). p99 is unchanged, because that is workerd's HTTP pipeline, not the
+guest.
+
+It is narrower than a kernel: no threads (`clone` is `-ENOSYS`), a synthetic
+socket layer instead of TCP, a stub file system, and one request per
+connection.
+
+That is why the kernel remains the general path and the fallback: a binary is
+only runnable through AOT if it fits that shape. This one does.
+
 ## Repo layout
 
 ```
-worker/
-  index.ts         the Worker: boots the kernel once, proxies requests
-  kernel.ts        the kernel factory bound to this Worker
-  assets.d.ts      types for the wrangler-bundled .wasm import
-sdk/               the forked host runtime (vsock, kwtty, HTTP, WASI, console)
-rust/
-  Cargo.toml       "unkernel-axum" crate
-  src/main.rs      the Axum hello world
-guest/init/
-  init.c           the guest init: mounts, loopback, kwtty, reaping
-kernel/
-  build-kernel.sh  the fork build (Docker): vmlinux32 + base initrd + cmdline
-  kw_worker.config the kernel config fragment (JIT off, this app only)
-  image/           the build image, the in-container script and the bundler
-scripts/
-  kernel-prep.mjs  sections, exports and initrd for the deployed kernel
-  guest-exec.mjs   run a command in the debug image (WITH_SHELL=1)
-  bench.mjs        cold/warm benchmark (spawns `cf dev`)
-  jit-capture-20.mjs, jit-ab.mjs  the AOT-JIT investigation (not in the build)
-build.sh           npm install + Docker guest build + kernel prep + wasm-opt
+worker/index.ts       boot, turns, timeouts, Server-Timing
+worker/kernel.ts      the kernel factory bound to this Worker
+sdk/                  the forked host runtime (vsock, kwtty, HTTP, WASI, console)
+rust/src/main.rs      the Axum server
+guest/init/init.c     mounts, loopback, kwtty, reaping
+kernel/               the fork build, config fragment and build image
+scripts/              kernel prep, guest exec, benchmark
+build.sh              guest builds + kernel prep + wasm-opt
 cloudflare.config.ts  the Worker (name, entrypoint, compat flags)
 wrangler.config.ts    the bundler (minified, no source maps)
 ```
 
-The large files in `assets/` are build artifacts (gitignored) produced by
-`./build.sh` (and by the kernel fork's build for `assets/unkernel.fork.wasm`).
+`assets/` holds build artifacts and is gitignored.
 
-## Prerequisites
+## Build and run
 
-- Node 24+
-- Docker (with the `linux/arm64` platform)
-- [binaryen](https://github.com/WebAssembly/binaryen) (`brew install binaryen`)
-- A Cloudflare account for deploy (optional for local dev)
-
-## Build
+Requires Node 24+, Docker with the `linux/arm64` platform, and
+[binaryen](https://github.com/WebAssembly/binaryen) (`brew install binaryen`).
 
 ```sh
 git clone https://github.com/oscartbeaumont/unkernel-rust-workers
@@ -276,21 +241,45 @@ cd unkernel-rust-workers
 npm install
 
 npm run kernel          # the specialized kernel -> assets/unkernel.fork.wasm
-./build.sh              # guest binaries (Docker) + kernel prep + wasm-opt
-WITH_SHELL=1 ./build.sh # the debug image (see below)
-KERNEL=path ./build.sh  # prepare another kernel (default: the fork kernel)
-npm run build           # ./build.sh + cf build (wrangler under the hood)
+./build.sh              # guest binaries + kernel prep + wasm-opt
+npm run build           # ./build.sh + cf build
 ```
 
-`./build.sh` builds the Axum server and the guest init in `rust:1-alpine` for
-`aarch64-unknown-linux-musl` (static, stripped, LTO), then prepares the kernel
-and optimizes it with `wasm-opt`. The artifacts in `assets/` are gitignored.
+The kernel build runs in Docker (Ubuntu 26.04, clang/lld 22, Zig 0.16). The
+first run compiles a patched `wasm-ld` and takes 10–60 minutes; later runs are
+seconds because the toolchain and checkout live in a Docker volume. A rebuild
+reproduces the size and config, not necessarily the bytes: codegen depends on
+the exact LLVM patch release. One non-obvious requirement: the pinned SDK does
+not provide the virtio imports, so the kernel must be built with
+`KWVIRTIO=n`; otherwise it traps on the first call.
+
+`./build.sh` uses `assets/unkernel.fork.wasm` when present and the npm
+package's kernel otherwise; `KERNEL=path` overrides both.
+
+For local development:
+
+```sh
+npx cf dev
+```
+
+```sh
+curl http://localhost:8787/
+curl http://localhost:8787/health
+curl -X POST --data 'hi' http://localhost:8787/echo
+```
+
+To deploy:
+
+```sh
+npx cf auth login   # once
+npx cf deploy
+```
 
 ### The shell image (opt-in)
 
-The default image's only userland is the init and kwtty: no busybox, no shell,
-and `vm.exec()` would fail (the Worker never needs it). When debugging is
-worth ~760 KB of upload (and some cold start), build the base image with:
+The default image has no busybox and no shell; the Worker only needs
+`createKernel`, `spawn`, `connect` and `fetch`. When debugging is worth
+~760 KB of upload and some cold start:
 
 ```sh
 WITH_SHELL=1 ./build.sh
@@ -298,79 +287,32 @@ node scripts/guest-exec.mjs uname -a
 node scripts/guest-exec.mjs sh -c 'ls -l /hello; cat /proc/meminfo'
 ```
 
-That image keeps the package's base userland (busybox, the kw tools, a shell
-on the console) and adds the server at `/hello/axum-hello`, which is all the
-Worker spawns either way. It is larger and boots slower; deploy the default
-image unless you need the shell.
+## Limits
 
-## Run locally
+- One kernel per isolate, booted on the first request. Eviction means a fresh
+  boot next time.
+- The guest has **one CPU**. Workers has no shared-memory wasm threads, so
+  unkernel's SMP kernel cannot run here and Tokio's multi-thread runtime gets
+  one worker. `current_thread` is the right shape. (Details in
+  [issue #1](https://github.com/oscartbeaumont/unkernel-rust-workers/issues/1).)
+- Only one request context drives the guest at a time. Batched turns make that
+  cheap for small requests; a response over 256 KiB streams from its own turn
+  and holds the VM until the client is done.
+- The guest has no inbound network: loopback only, and the Worker is its only
+  client. Connections cannot be pooled across requests.
+- The guest runs on the interpreter: Workers does not allow dynamic wasm
+  compilation. Startup and the server are well inside the CPU budget.
+- `no_handle_cross_request_promise_resolution` is required. The kernel boots
+  in the first request that runs it, and its JSPI chains settle in later
+  requests; the default handling would drop them once the boot request ends.
+  A turn keeps its own continuations inside one request, so the legacy
+  behavior is safe here.
 
-```sh
-npx cf dev
-```
+## Credits and licenses
 
-then in another terminal:
-
-```sh
-curl http://localhost:8787/
-# Hello from unkernel-rs (Rust + Axum on Cloudflare Workers)
-curl http://localhost:8787/health
-# ok
-curl -X POST --data 'hi' http://localhost:8787/echo
-# hi
-```
-
-The first request boots the kernel (~65 ms). Requests after that are a few
-milliseconds. The guest's boot log goes to the Worker logs.
-
-## Deploy
-
-```sh
-npx cf auth login   # once
-npx cf deploy
-```
-
-The deploy uploads ~3.5 MB of wasm and ~0.06 MB of script (well within the
-Workers size limit); the kernel is an imported module, never served as a
-static asset.
-
-## Notes and limitations
-
-- One kernel per isolate, booted on the first request. After the isolate is
-  evicted, the next request boots a fresh one.
-- **The 3 s stalls are fixed.** A rare stall came from resuming a JSPI
-  stack synchronously inside another wasm import (`wasm_switch_to`'s
-  `resume(prev)` and the poll wake in `sdk/kernel.ts`): under workerd, V8
-  could lose the continuation, leaving the guest's scheduler parked with a
-  vsock IRQ pending and no progress. Both resumes now run on a microtask.
-  Measured: 0 stalls in 400 sequential and 2,000 concurrent requests (was a
-  few per few hundred, each 3 s). The Worker still bounds a guest that stops
-  answering: no first byte in 3 s recycles the VM and replays once, with a
-  keepalive timer so the runtime does not treat the replay as hung. The
-  timeout covers time to first byte, not the body.
-- Connections cannot be pooled across requests: a stream opened in one
-  request cannot be read in another (workerd cancels the request as hung), so
-  each connection lives inside the turn that opened it. A turn can hold
-  several at once. A reused connection is 4–5× cheaper in the guest (0.11 ms
-  vs 0.55 ms for `/health`), but it is not available here.
-- The default guest image has no shell (`vm.exec()` would fail); the Worker
-  only needs `createKernel`, `spawn`, `connect` and `fetch`. `WITH_SHELL=1`
-  builds the debugging image that has one.
-- The guest runs on the interpreter (`jit: false`), since Workers does not
-  allow dynamic wasm compilation. Startup and the axum server are well
-  within the 30 s per-request CPU budget.
-- `compatibilityFlags: ["no_handle_cross_request_promise_resolution"]`
-  is required: the kernel boots in the first request that runs it, and its
-  JSPI promise chains settle in later requests. The default handling would
-  drop those continuations once the boot request ends. A turn keeps its own
-  continuations inside one request, so the legacy behavior is safe here; it is
-  what lets the shared kernel outlive its first request.
-- The guest runs the usual unkernel limitations (e.g. no SMP, no inbound
-  connections); nothing more is done here than the SDK supports.
-
-## Licenses
-
-- `worker/`, `sdk/`, `rust/`, `guest/`, `scripts/`, `build.sh`: MIT (same as
-  the unkernel SDK)
-- `assets/unkernel.wasm`: Linux kernel + unkernel guest, GPL-2.0-only /
-  MIT mix — see https://github.com/pithings/unkernel for the full text
+- [unkernel](https://github.com/pithings/unkernel) by Pooya Parsa and
+  contributors: the kernel, kwemu, vsock/kwtty and the host runtime this repo
+  forks. MIT.
+- The Linux kernel in the image: GPL-2.0-only.
+- `worker/`, `sdk/`, `rust/`, `guest/`, `scripts/` and `build.sh`: MIT,
+  same as unkernel.
