@@ -262,6 +262,10 @@ The large files in `assets/` are build artifacts (gitignored) produced by
 ## Build
 
 ```sh
+git clone https://github.com/oscartbeaumont/unkernel-rust-workers
+cd unkernel-rust-workers
+npm install
+
 npm run kernel          # the specialized kernel -> assets/unkernel.fork.wasm
 ./build.sh              # guest binaries (Docker) + kernel prep + wasm-opt
 WITH_SHELL=1 ./build.sh # the debug image (see below)
