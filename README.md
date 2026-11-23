@@ -140,28 +140,33 @@ of a fixed 150 ms poll.
   random values in global scope, and the kernel needs `random_get()` to
   boot — an isolate cannot start the VM until a request handler runs.
 
-### The next structural step: AOT (not shipped)
+### The other path: AOT (works, not shipped)
 
-The kernel path is what this repo ships, but the interesting open question is
-whether the *binary itself* can be translated to wasm at build time, dropping
-the kernel and kwemu entirely. A prototype in `~/gh/oscartbeaumont-labs/unkernel-aot`
-(aarch64 → wasm translator, Linux ABI shim, Worker harness) says yes for a
-small guest, and measures what it would take for this one:
+The kernel path is what this repo ships and what runs in production. The
+same binary can instead be **translated to wasm at build time**, dropping the
+kernel and kwemu entirely. That project lives in
+`~/gh/oscartbeaumont-labs/unkernel-aot` (aarch64 → wasm translator, Linux ABI
+shim, Worker harness) and it now runs this exact `axum-hello.bin` — musl,
+tokio, hyper and all — with no kernel and no interpreter:
 
-| | kernel + kwemu (shipped) | AOT demo (asm-httpd) | AOT of `axum-hello` |
-| --- | --- | --- | --- |
-| wasm | 4,438,054 B | **5,076 B** | 3,451,738 B (integer subset) |
-| boot | ~70 ms | **0.12 ms** (workerd, 200-boot avg) | 0.59 ms to first trap |
-| warm `/health` | ~1.9 ms p50 | **0.65 ms p50** (0.63 is a static Worker; guest ≈ 20 µs) | not reachable yet |
+| | kernel + kwemu (shipped) | AOT of this binary |
+| --- | --- | --- |
+| module | 4,438,054 B | 4,462,977 B |
+| upload raw / gzip | 4,387 KiB / 1,740 KiB | 4,436 KiB / **1,344 KiB** |
+| boot to "listening" | ~70 ms | **~11 ms** (workerd, 200 boots; 6 ms Node) |
+| warm `/health` p50 / p99 | ~1.9 / ~2.8 ms | **0.86 / 2.64 ms** |
+| guest work per request | — | **~103 µs** |
+| correctness evidence | real Linux kernel | 19/19 differential guests byte-identical, 2,000 requests 0 failures |
 
-Translation takes 46 ms for the whole binary and already covers 98.4% of its
-117,688 reachable instructions. It stops in musl's NEON `memset` before
-`main`: ~1,700 NEON/vector instructions (1.6%, ~40 opcodes that map close to
-1:1 onto wasm SIMD), 3 scalar FP, 7 atomics, plus the syscall surface (futex,
-fcntl, epoll, mmap, sockets, signals, clone). The remaining work is the long
-tail of semantics: realistically **4–8 weeks**, with the size and boot prizes
-above as the payoff. It is not in the bundle today, and this repo has no
-fallback for a binary the translator cannot run.
+Honest read: the win is **boot (~6×) and per-request p50 (~2×)**, plus a much
+smaller trusted computing base. It is **not** a raw-size win for a binary of
+this size (4.46 MB against 4.44 MB; gzip is 23% smaller), and p99 is unchanged
+because it is workerd's HTTP pipeline, not the guest. The AOT runtime is also
+narrower than a kernel: no threads (`clone` is `-ENOSYS`), a synthetic socket
+layer instead of TCP, a stub file system, and one request per connection. That
+is why it is not the default here yet: a binary is only runnable if it fits
+that shape (this one does), so this repo keeps the kernel as the general path
+and the fallback.
 ## Repo layout
 
 ```
