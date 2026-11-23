@@ -1,5 +1,12 @@
 # unkernel-rs
 
+> **Built on [unkernel](https://github.com/pithings/unkernel)** by
+> [Pooya Parsa (@pi0)](https://github.com/pi0): the Linux kernel compiled to
+> WebAssembly, kwemu, the vsock/kwtty stack and the host runtime under `sdk/`
+> are unkernel's work, not this repo's. This project vendors a fork of that
+> runtime, builds the kernel from a pinned fork commit, and adds the Rust +
+> Axum guest, the guest init and the Cloudflare Worker around it.
+
 A Rust + Axum hello world running in Cloudflare Workers — as a real Linux
 process, not as a wasm binary.
 
