@@ -9,7 +9,8 @@
     "build": "npm run assets && cf build",
     "dev": "cf dev",
     "deploy": "npm run assets && cf deploy",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "kernel": "kernel/build-kernel.sh"
   },
   "devDependencies": {
     "cf": "^1.0.0-rc.2",

@@ -81,11 +81,20 @@ tree and toolchain:
 
 `KWVIRTIO=n` is not optional with the pinned SDK: the fork's defconfig kernel
 imports `unkernel.wasm_driver_virtio_*`, which the SDK does not provide, and
-the kernel traps on the first call. Building the kernel needs Docker, Zig
-0.16 and a patched `wasm-ld` built from LLVM 22 (about 10 minutes once, then
-2–5 minutes per kernel); `./build.sh` uses `assets/unkernel.fork.wasm` when it
-is present and the published package's kernel otherwise (`KERNEL=path`
-overrides both).
+the kernel traps on the first call.
+
+Build it with `npm run kernel` (`kernel/build-kernel.sh`): Docker only —
+Ubuntu 26.04 with clang/lld 22, Zig 0.16 from ziglang.org, and unkernel's own
+`kernel/build.sh` builds the patched `wasm-ld` from LLVM 22 on the first run
+(about 10 minutes; ~8 s after that, since the toolchain, the checkout and the
+kernel build live in a Docker volume). It pins
+`pithings/unkernel@2abdc598e2d08c2a4d673254ae4581703d33a7a8` and writes the
+bundled kernel (vmlinux32 + the package's base initrd + cmdline, sha256
+`d796630c…`) to `assets/unkernel.fork.wasm`. The config fragment is
+`kernel/kw_worker.config`.
+
+`./build.sh` uses `assets/unkernel.fork.wasm` when it is present and the
+published package's kernel otherwise (`KERNEL=path` overrides both).
 
 ### The Worker script
 
@@ -138,6 +147,10 @@ rust/
   src/main.rs      the Axum hello world
 guest/init/
   init.c           the guest init: mounts, loopback, kwtty, reaping
+kernel/
+  build-kernel.sh  the fork build (Docker): vmlinux32 + base initrd + cmdline
+  kw_worker.config the kernel config fragment (JIT off, this app only)
+  image/           the build image, the in-container script and the bundler
 scripts/
   kernel-prep.mjs  sections, exports and initrd for the deployed kernel
   guest-exec.mjs   run a command in the debug image (WITH_SHELL=1)
@@ -161,6 +174,7 @@ The large files in `assets/` are build artifacts (gitignored) produced by
 ## Build
 
 ```sh
+npm run kernel          # the specialized kernel -> assets/unkernel.fork.wasm
 ./build.sh              # guest binaries (Docker) + kernel prep + wasm-opt
 WITH_SHELL=1 ./build.sh # the debug image (see below)
 KERNEL=path ./build.sh  # prepare another kernel (default: the fork kernel)

@@ -8,3 +8,4 @@ rust/target/
 .env*
 guest/init/target/
 *.tmp.mjs
+kernel/out/
