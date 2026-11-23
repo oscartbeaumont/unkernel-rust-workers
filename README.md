@@ -86,12 +86,18 @@ the kernel traps on the first call.
 Build it with `npm run kernel` (`kernel/build-kernel.sh`): Docker only —
 Ubuntu 26.04 with clang/lld 22, Zig 0.16 from ziglang.org, and unkernel's own
 `kernel/build.sh` builds the patched `wasm-ld` from LLVM 22 on the first run
-(about 10 minutes; ~8 s after that, since the toolchain, the checkout and the
-kernel build live in a Docker volume). It pins
-`pithings/unkernel@2abdc598e2d08c2a4d673254ae4581703d33a7a8` and writes the
-bundled kernel (vmlinux32 + the package's base initrd + cmdline, sha256
-`d796630c…`) to `assets/unkernel.fork.wasm`. The config fragment is
+(the LLVM build dominates: 10–60 minutes depending on the machine; ~8 s after
+that, since the toolchain, the checkout and the kernel build live in a Docker
+volume). It pins `pithings/unkernel@2abdc598e2d08c2a4d673254ae4581703d33a7a8`
+and writes the bundled kernel (vmlinux32 + the package's base initrd +
+cmdline, 6,069,048 B) to `assets/unkernel.fork.wasm`. The config fragment is
 `kernel/kw_worker.config`.
+
+A rebuild reproduces the kernel's size and config, not necessarily its bytes:
+the shipped bundle is the recipe's output (`sha256 0a4705…`), and an
+independent build here came out byte-different with the same size and config
+(codegen depends on the exact LLVM patch release that apt's `clang-22`
+resolves to).
 
 `./build.sh` uses `assets/unkernel.fork.wasm` when it is present and the
 published package's kernel otherwise (`KERNEL=path` overrides both).
