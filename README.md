@@ -106,6 +106,7 @@ guest/init/
   init.c           the guest init: mounts, loopback, kwtty, reaping
 scripts/
   kernel-prep.mjs  sections, exports and initrd for the deployed kernel
+  guest-exec.mjs   run a command in the debug image (WITH_SHELL=1)
   patch-sdk.mjs    the kwtty retry interval (100 ms -> 5 ms)
   bench.mjs        cold/warm benchmark (spawns `cf dev`)
   jit-capture-20.mjs, jit-ab.mjs  the AOT-JIT investigation (not in the build)
@@ -127,13 +128,31 @@ The large files in `assets/` are build artifacts (gitignored) produced by
 ## Build
 
 ```sh
-./build.sh       # guest binaries (Docker) + kernel prep + wasm-opt
-npm run build    # ./build.sh + cf build (wrangler under the hood)
+./build.sh              # guest binaries (Docker) + kernel prep + wasm-opt
+WITH_SHELL=1 ./build.sh # the debug image (see below)
+npm run build           # ./build.sh + cf build (wrangler under the hood)
 ```
 
 `./build.sh` builds the Axum server and the guest init in `rust:1-alpine` for
 `aarch64-unknown-linux-musl` (static, stripped, LTO), then prepares the kernel
 and optimizes it with `wasm-opt`. The artifacts in `assets/` are gitignored.
+
+### The shell image (opt-in)
+
+The default image's only userland is the init and kwtty: no busybox, no shell,
+and `vm.exec()` would fail (the Worker never needs it). When debugging is
+worth ~760 KB of upload (and ~300 ms of cold start), build the base image with:
+
+```sh
+WITH_SHELL=1 ./build.sh
+node scripts/guest-exec.mjs uname -a
+node scripts/guest-exec.mjs sh -c 'ls -l /hello; cat /proc/meminfo'
+```
+
+That image keeps the package's base userland (busybox, the kw tools, a shell
+on the console) and adds the server at `/hello/axum-hello`, which is all the
+Worker spawns either way. It is larger and boots slower; deploy the default
+image unless you need the shell.
 
 ## Run locally
 
@@ -169,8 +188,9 @@ size limit); the kernel is an imported module, never served as a static asset.
 
 - One kernel per isolate, booted on the first request. After the isolate is
   evicted, the next request boots a fresh one.
-- The guest image has no shell (`vm.exec()` would fail); the Worker only
-  needs `createKernel`, `spawn`, `connect` and `fetch`.
+- The default guest image has no shell (`vm.exec()` would fail); the Worker
+  only needs `createKernel`, `spawn`, `connect` and `fetch`. `WITH_SHELL=1`
+  builds the debugging image that has one.
 - The guest runs on the interpreter (`jit: false`), since Workers does not
   allow dynamic wasm compilation. Startup and the axum server are well
   within the 30 s per-request CPU budget.

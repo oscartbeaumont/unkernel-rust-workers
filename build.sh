@@ -17,7 +17,13 @@
 # busybox, no overlay, no 9p mount, no data module. (vm.exec() needs a shell
 # this image does not have; createKernel/spawn/connect/fetch are all it needs.)
 #
-# Usage: ./build.sh    (from the repository root; needs Docker and binaryen)
+# Shell image (opt-in, for debugging): WITH_SHELL=1 keeps the SDK's base userland
+# (busybox, the kw tools, a shell on the console, so vm.exec() works) and adds
+# the server at /hello/axum-hello. It costs ~760 KB of upload and boots slower
+# (the base init does more work: ~390 ms cold instead of ~85 ms).
+#
+# Usage: ./build.sh              (from the repository root; needs Docker and binaryen)
+#        WITH_SHELL=1 ./build.sh (debug image: base userland + the server)
 set -eu
 
 cd "$(dirname "$0")"
@@ -43,15 +49,28 @@ docker run --rm --platform linux/arm64 \
          cp target/aarch64-unknown-linux-musl/release/axum-hello /out/axum-hello.bin &&
          gcc -static -Os -s -o /out/kw-init /init/init.c"
 
-echo "==> preparing the kernel (sections, exports, initrd)"
-node scripts/kernel-prep.mjs \
-  --in assets/unkernel.src.wasm \
-  --out assets/unkernel.prep.wasm \
-  --binary assets/axum-hello.bin \
-  --guest-path /hello/axum-hello \
-  --minimal-initrd \
-  --add /init=assets/kw-init \
-  --add-from-initrd /usr/bin/kwtty=kw/layer/usr/bin/kwtty
+if [ "${WITH_SHELL:-0}" = 1 ]; then
+  # Debug image: the package's base userland (busybox, a shell on the console,
+  # the kw tools) plus the server. The Worker boots no distro disk, so the base
+  # init keeps the initramfs as its root and /hello/axum-hello is there; the
+  # Worker spawns the same path in both images.
+  echo "==> preparing the kernel (sections, exports, initrd: base image + shell)"
+  node scripts/kernel-prep.mjs \
+    --in assets/unkernel.src.wasm \
+    --out assets/unkernel.prep.wasm \
+    --binary assets/axum-hello.bin \
+    --guest-path /hello/axum-hello
+else
+  echo "==> preparing the kernel (sections, exports, initrd: init + kwtty + server)"
+  node scripts/kernel-prep.mjs \
+    --in assets/unkernel.src.wasm \
+    --out assets/unkernel.prep.wasm \
+    --binary assets/axum-hello.bin \
+    --guest-path /hello/axum-hello \
+    --minimal-initrd \
+    --add /init=assets/kw-init \
+    --add-from-initrd /usr/bin/kwtty=kw/layer/usr/bin/kwtty
+fi
 
 echo "==> optimizing the kernel with wasm-opt (binaryen)"
 if ! command -v wasm-opt >/dev/null 2>&1; then
