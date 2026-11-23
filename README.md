@@ -140,6 +140,28 @@ of a fixed 150 ms poll.
   random values in global scope, and the kernel needs `random_get()` to
   boot — an isolate cannot start the VM until a request handler runs.
 
+### The next structural step: AOT (not shipped)
+
+The kernel path is what this repo ships, but the interesting open question is
+whether the *binary itself* can be translated to wasm at build time, dropping
+the kernel and kwemu entirely. A prototype in `~/gh/oscartbeaumont-labs/unkernel-aot`
+(aarch64 → wasm translator, Linux ABI shim, Worker harness) says yes for a
+small guest, and measures what it would take for this one:
+
+| | kernel + kwemu (shipped) | AOT demo (asm-httpd) | AOT of `axum-hello` |
+| --- | --- | --- | --- |
+| wasm | 4,438,054 B | **5,076 B** | 3,451,738 B (integer subset) |
+| boot | ~70 ms | **0.12 ms** (workerd, 200-boot avg) | 0.59 ms to first trap |
+| warm `/health` | ~1.9 ms p50 | **0.65 ms p50** (0.63 is a static Worker; guest ≈ 20 µs) | not reachable yet |
+
+Translation takes 46 ms for the whole binary and already covers 98.4% of its
+117,688 reachable instructions. It stops in musl's NEON `memset` before
+`main`: ~1,700 NEON/vector instructions (1.6%, ~40 opcodes that map close to
+1:1 onto wasm SIMD), 3 scalar FP, 7 atomics, plus the syscall surface (futex,
+fcntl, epoll, mmap, sockets, signals, clone). The remaining work is the long
+tail of semantics: realistically **4–8 weeks**, with the size and boot prizes
+above as the payoff. It is not in the bundle today, and this repo has no
+fallback for a binary the translator cannot run.
 ## Repo layout
 
 ```
