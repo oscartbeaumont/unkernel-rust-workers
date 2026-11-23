@@ -23,7 +23,7 @@ async fn main() {
 }
 
 async fn hello() -> &'static str {
-    "Hello from unkernel-rs (Rust + Axum on Cloudflare Workers)
+    "Hello from unkernel-rust-workers (Rust + Axum on Cloudflare Workers)
 "
 }
 

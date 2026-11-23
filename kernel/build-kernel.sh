@@ -1,6 +1,6 @@
 #!/bin/sh
 # build-kernel.sh - build unkernel's Linux kernel specialized for the
-# unkernel-rs Worker, in Docker, and write the BUNDLED kernel module the repo's
+# unkernel-rust-workers Worker, in Docker, and write the BUNDLED kernel module the repo's
 # build.sh wants at assets/unkernel.fork.wasm.
 #
 # What it produces: vmlinux32.wasm (the UP kernel, kwemu without its JIT tier,
@@ -22,7 +22,7 @@
 # it writes into the checkout is $OUT (assets/unkernel.fork.wasm by default).
 #
 # Env:
-#   REPO=<path>            the unkernel-rs checkout (default: this file's repo);
+#   REPO=<path>            the unkernel-rust-workers checkout (default: this file's repo);
 #                          its node_modules/unkernel/dist/unkernel.wasm supplies
 #                          the base initrd (npm install it first)
 #   OUT=<path>             where to write the bundled module

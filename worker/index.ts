@@ -164,7 +164,7 @@ function recycle(g: Guest, why: string): void {
   if (guest !== g) return; // already replaced by another request
   guest = undefined;
   bootPromise = undefined;
-  console.error(`[unkernel-rs] recycling the guest VM: ${why}`);
+  console.error(`[unkernel-rust-workers] recycling the guest VM: ${why}`);
   void g.vm.stop().catch(() => {});
 }
 
@@ -408,7 +408,7 @@ async function boot(): Promise<Guest> {
     // first request would race the boot and get a connection refused.
     await waitForServer(vm);
 
-    console.log(`[unkernel-rs] booted in ${Date.now() - start} ms`);
+    console.log(`[unkernel-rust-workers] booted in ${Date.now() - start} ms`);
     return { vm };
   } catch (e) {
     // Never leak a half-booted kernel into the next request.
@@ -577,8 +577,8 @@ function respond(job: Job): Response {
 
 function error(status: number, e: unknown): Response {
   const message = e instanceof Error ? e.message : String(e);
-  console.error(`[unkernel-rs] ${message}`);
-  return new Response(`unkernel-rs: ${message}\n`, {
+  console.error(`[unkernel-rust-workers] ${message}`);
+  return new Response(`unkernel-rust-workers: ${message}\n`, {
     status,
     headers: { "content-type": "text/plain; charset=utf-8" },
   });

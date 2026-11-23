@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * A small benchmark for the unkernel-rs worker.
+ * A small benchmark for the unkernel-rust-workers Worker.
  *
  * Modes:
  *   --cold          start a fresh dev server per run, time the first request

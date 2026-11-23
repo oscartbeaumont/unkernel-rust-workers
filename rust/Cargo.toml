@@ -2,7 +2,7 @@
 name = "unkernel-axum"
 version = "0.1.0"
 edition = "2021"
-description = "A tiny Axum hello world: the guest program for unkernel-rs"
+description = "A tiny Axum hello world: the guest program for unkernel-rust-workers"
 
 [[bin]]
 name = "axum-hello"

@@ -1,4 +1,4 @@
-# unkernel-rs
+# unkernel-rust-workers
 
 > **Built on [unkernel](https://github.com/pithings/unkernel)** by
 > [Pooya Parsa (@pi0)](https://github.com/pi0): the Linux kernel compiled to
@@ -12,10 +12,10 @@ WebAssembly, in a Cloudflare Worker. The app is an ordinary
 `aarch64-unknown-linux-musl` binary: nothing in it knows about Workers, wasm
 or the edge.
 
-**Live:** https://unkernel-rs.oscartbeaumont.workers.dev
+**Live:** https://unkernel-rust-workers.oscartbeaumont.workers.dev
 
 ```sh
-curl https://unkernel-rs.oscartbeaumont.workers.dev/health
+curl https://unkernel-rust-workers.oscartbeaumont.workers.dev/health
 # ok
 ```
 

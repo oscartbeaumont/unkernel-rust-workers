@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs inside the build image (image/Dockerfile), driven by build-kernel.sh.
 # Mounts: /cache (the keep-forever volume), /work (this lab, read-only),
-# /out (where the bundled kernel is written), /repo (the unkernel-rs checkout,
+# /out (where the bundled kernel is written), /repo (the unkernel-rust-workers checkout,
 # read-only; its node_modules/unkernel/dist/unkernel.wasm has the base initrd).
 set -euo pipefail
 

@@ -1,5 +1,5 @@
 {
-  "name": "unkernel-rs",
+  "name": "unkernel-rust-workers",
   "version": "0.1.0",
   "description": "A Rust + Axum hello world in Cloudflare Workers, running inside a Linux kernel compiled to WebAssembly (unkernel)",
   "type": "module",

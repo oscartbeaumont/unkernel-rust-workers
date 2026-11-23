@@ -2,7 +2,7 @@ import { defineConfig } from "cf/config";
 
 export default defineConfig({
 	worker: {
-		name: "unkernel-rs",
+		name: "unkernel-rust-workers",
 		compatibilityDate: "2026-11-17",
 		// The kernel boots in the first request that runs it and then lives in
 		// the isolate: its promise chains (JSPI continuations) settle in later
