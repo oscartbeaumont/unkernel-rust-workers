@@ -156,6 +156,7 @@ tokio, hyper and all — with no kernel and no interpreter:
 | warm `/health` p50 / p99 | ~1.9 / ~2.8 ms | **0.86 / 2.64 ms** |
 | guest work per request | — | **~103 µs** |
 | correctness evidence | real Linux kernel | 19/19 differential guests byte-identical, 2,000 requests 0 failures |
+| body streaming | (whole request/response through vsock) | 64 KiB chunks both ways: a 64 MiB echo with 64 KiB buffered |
 
 Honest read: the win is **boot (~6×) and per-request p50 (~2×)**, plus a much
 smaller trusted computing base. It is **not** a raw-size win for a binary of
