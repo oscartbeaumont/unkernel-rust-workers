@@ -7,3 +7,4 @@ rust/target/
 .dev.vars*
 .env*
 guest/init/target/
+*.tmp.mjs

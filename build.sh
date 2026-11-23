@@ -31,12 +31,21 @@ cd "$(dirname "$0")"
 echo "==> installing npm dependencies"
 npm install --no-audit --no-fund
 
-echo "==> patching the SDK's kwtty retry (100 ms -> 5 ms)"
-node scripts/patch-sdk.mjs
-
-echo "==> copying the kernel from the published unkernel package"
 mkdir -p assets
-cp node_modules/unkernel/dist/unkernel.wasm assets/unkernel.src.wasm
+
+# Which kernel to prepare: KERNEL=path, else the specialized kernel in
+# assets/unkernel.fork.wasm (built from the unkernel fork, see the README),
+# else the published package's.
+kernel_src="${KERNEL:-}"
+if [ -z "$kernel_src" ] && [ -f assets/unkernel.fork.wasm ]; then
+  kernel_src=assets/unkernel.fork.wasm
+  echo "==> using the specialized kernel (assets/unkernel.fork.wasm)"
+fi
+if [ -z "$kernel_src" ]; then
+  echo "==> copying the kernel from the published unkernel package"
+  cp node_modules/unkernel/dist/unkernel.wasm assets/unkernel.src.wasm
+  kernel_src=assets/unkernel.src.wasm
+fi
 
 echo "==> building the guest binaries (aarch64-unknown-linux-musl, static)"
 docker run --rm --platform linux/arm64 \
@@ -56,14 +65,14 @@ if [ "${WITH_SHELL:-0}" = 1 ]; then
   # Worker spawns the same path in both images.
   echo "==> preparing the kernel (sections, exports, initrd: base image + shell)"
   node scripts/kernel-prep.mjs \
-    --in assets/unkernel.src.wasm \
+    --in "$kernel_src" \
     --out assets/unkernel.prep.wasm \
     --binary assets/axum-hello.bin \
     --guest-path /hello/axum-hello
 else
   echo "==> preparing the kernel (sections, exports, initrd: init + kwtty + server)"
   node scripts/kernel-prep.mjs \
-    --in assets/unkernel.src.wasm \
+    --in "$kernel_src" \
     --out assets/unkernel.prep.wasm \
     --binary assets/axum-hello.bin \
     --guest-path /hello/axum-hello \

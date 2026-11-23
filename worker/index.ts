@@ -15,7 +15,7 @@
  */
 
 import { createKernel } from "./kernel";
-import type { KernelInstance } from "unkernel/web";
+import type { KernelInstance } from "../sdk/index.ts";
 
 /** Where scripts/kernel-prep.mjs packs the binary into the guest's initrd. */
 const GUEST_FILE = "/hello/axum-hello";
@@ -24,17 +24,28 @@ const GUEST_PORT = 3000;
 /** How long the server may take to bind before boot is considered failed. */
 const READY_TIMEOUT_MS = 10000;
 
-let bootPromise: Promise<KernelInstance> | undefined;
+interface Guest {
+  vm: KernelInstance;
+}
+
+/** A guest request with no response by then marks this VM dead (see recycle()). */
+const GUEST_TIMEOUT_MS = 3000;
+
+let guest: Guest | undefined;
+let bootPromise: Promise<Guest> | undefined;
 
 /**
  * The one boot of this isolate. Every caller gets the same promise; a boot
  * that fails is dropped so the next request tries again instead of awaiting
  * a failure forever.
  */
-function ensureBoot(): Promise<KernelInstance> {
-  let p = bootPromise;
-  if (!p) {
-    p = boot();
+function ensureBoot(): Promise<Guest> {
+  if (guest) return Promise.resolve(guest);
+  if (!bootPromise) {
+    const p = boot().then((g) => {
+      guest = g;
+      return g;
+    });
     bootPromise = p;
     // Handle the rejection so a boot that fails before a caller awaits it
     // does not surface as an unhandled rejection.
@@ -42,10 +53,24 @@ function ensureBoot(): Promise<KernelInstance> {
       if (bootPromise === p) bootPromise = undefined;
     });
   }
-  return p;
+  return bootPromise;
 }
 
-async function boot(): Promise<KernelInstance> {
+/**
+ * Drop a VM that stopped answering. The guest occasionally stops serving a
+ * long-lived isolate (kwtty stops accepting; see the wedge notes in the
+ * README): a request that timed out gets a 502, and the next one boots a
+ * fresh kernel (~85 ms) instead of the isolate failing for good.
+ */
+function recycle(g: Guest, why: string): void {
+  if (guest !== g) return; // already replaced by another request
+  guest = undefined;
+  bootPromise = undefined;
+  console.error(`[unkernel-rs] recycling the guest VM: ${why}`);
+  void g.vm.stop().catch(() => {});
+}
+
+async function boot(): Promise<Guest> {
   const start = Date.now();
   let vm: KernelInstance | undefined;
   try {
@@ -73,7 +98,7 @@ async function boot(): Promise<KernelInstance> {
     await waitForServer(vm);
 
     console.log(`[unkernel-rs] booted in ${Date.now() - start} ms`);
-    return vm;
+    return { vm };
   } catch (e) {
     // Never leak a half-booted kernel into the next request.
     if (vm) vm.stop().catch(() => {});
@@ -133,28 +158,41 @@ async function drain(stream: ReadableStream<Uint8Array>, name: string): Promise<
 
 export default {
   async fetch(request: Request): Promise<Response> {
-    let vm: KernelInstance;
-    try {
-      vm = await ensureBoot();
-    } catch (e) {
-      // A failed boot must not poison the isolate: retry on the next request.
-      return error(500, e);
-    }
+    // The guest runs the server on its loopback port; forward the path and
+    // query, and let the guest see a normal Host header. One connection per
+    // request: a stream opened in one request cannot be read in another (the
+    // runtime cancels the request as hung), so connections cannot be pooled.
+    const url = new URL(request.url);
+    const guestUrl = `http://localhost:${GUEST_PORT}${url.pathname}${url.search}`;
+    const headers = new Headers(request.headers);
+    headers.delete("host");
+    // Buffered so a request that found the guest unresponsive can be replayed.
+    const body = request.body ? await request.arrayBuffer() : undefined;
 
-    try {
-      // The guest runs the server on its loopback port; forward the path and
-      // query, and let the guest see a normal Host header.
-      const url = new URL(request.url);
-      const guestUrl = `http://localhost:${GUEST_PORT}${url.pathname}${url.search}`;
-      const headers = new Headers(request.headers);
-      headers.delete("host");
-      return await vm.fetch(guestUrl, {
-        method: request.method,
-        headers,
-        body: request.body,
-      });
-    } catch (e) {
-      return error(502, e);
+    for (let attempt = 0; ; attempt++) {
+      let g: Guest;
+      try {
+        g = await ensureBoot();
+      } catch (e) {
+        // A failed boot must not poison the isolate: retry on the next request.
+        return error(500, e);
+      }
+      const timeout = AbortSignal.timeout(GUEST_TIMEOUT_MS);
+      try {
+        return await g.vm.fetch(guestUrl, {
+          method: request.method,
+          headers,
+          body,
+          signal: AbortSignal.any([request.signal, timeout]),
+        });
+      } catch (e) {
+        // The guest stopped answering (a rare lost wakeup in the kernel/engine
+        // pairing): replace the VM and replay once on the fresh one.
+        if (!timeout.aborted || request.signal.aborted || attempt > 0) {
+          return error(502, e);
+        }
+        recycle(g, `no response within ${GUEST_TIMEOUT_MS} ms`);
+      }
     }
   },
 };
