@@ -151,6 +151,12 @@ rate instead of failing. A request that streams a large body holds the lease
 until the client finishes or disconnects, so a slow download delays the
 requests behind it: with one VM, correctness wins over interleaving.
 
+Every response carries `x-unkernel-queue-ms` (time waiting for the lease) and
+`x-unkernel-ttfb-ms` (time from acquiring the guest to its response head), so
+a client can separate the Worker's share from the edge's. At 400 requests,
+8-deep, against the deployed Worker they were p99 **16 ms** and **0–5 ms**,
+while the client saw 63 ms p50: most of that is TLS/edge/client, not the VM.
+
 ### Measured dead ends
 
 - **AOT replacement for the JIT (byte-keyed):** the JIT emits wasm modules at

@@ -230,7 +230,15 @@ export default {
     };
 
     for (let attempt = 0; ; attempt++) {
+      const queuedAt = Date.now();
       const release = await acquireGuest();
+      const acquiredAt = Date.now();
+      let ttfbAt = 0;
+      const noteSlow = (how: string) => {
+        const total = Date.now() - queuedAt;
+        if (total < 200) return;
+        console.log(`[slow] ${how} ` + JSON.stringify({ queue: acquiredAt - queuedAt, ttfb: ttfbAt ? ttfbAt - acquiredAt : null, total }));
+      };
       let g: Guest;
       try {
         g = await ensureBoot(ctx);
@@ -268,16 +276,29 @@ export default {
           body,
           signal: AbortSignal.any([request.signal, controller.signal]),
         }, {
-          head: () => clearTimeout(timer),
-          finished: releaseOnce,
+          head: () => {
+            ttfbAt = Date.now();
+            clearTimeout(timer);
+          },
+          finished: () => {
+            releaseOnce();
+            noteSlow("done");
+          },
         });
         stopKeepalive();
         // A response body holds the lease until it ends (fetchOver calls
         // finished); a body-less response is complete already.
-        if (!r.body) releaseOnce();
-        return r;
+        // The timings let a client tell queueing from the guest and from the
+        // edge: both are milliseconds unless something is wrong.
+        const outHeaders = new Headers(r.headers);
+        outHeaders.set("x-unkernel-queue-ms", String(acquiredAt - queuedAt));
+        outHeaders.set("x-unkernel-ttfb-ms", String((ttfbAt || Date.now()) - acquiredAt));
+        const out = new Response(r.body, { status: r.status, statusText: r.statusText, headers: outHeaders });
+        if (!out.body) releaseOnce();
+        return out;
       } catch (e) {
         releaseOnce();
+        noteSlow("error");
         // The guest stopped answering (a lost wakeup in the kernel/engine
         // pairing): replace the VM and replay once on the fresh one.
         if (!timedOut || request.signal.aborted || attempt > 0) {
