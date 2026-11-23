@@ -22,7 +22,7 @@ host.
 request ──► worker (Cloudflare Workers, TS)
                  │   boot on the first request of the isolate
                  ▼
-           unkernel kernel (WebAssembly, 4.44 MB, built from the fork)
+           unkernel kernel (WebAssembly, 3.52 MB, built from the fork)
                  │   init → kwtty, no busybox, no distro
                  ▼
            axum-hello (aarch64 musl binary, 790 KB, packed in the initrd)
@@ -48,22 +48,21 @@ request ──► worker (Cloudflare Workers, TS)
 
 ## Bundle size and startup
 
-The deployed bundle is one wasm module (4.44 MB) plus the Worker script
-(54 KB): **4,388 KiB raw / 1,740 KiB gzip** (`cf deploy --dry-run`).
+The deployed bundle is one wasm module (3.52 MB) plus the Worker script
+(54 KB): **3,489 KiB raw / 1,582 KiB gzip** (`cf deploy --dry-run`).
 
 | step | bytes |
 | --- | --- |
 | stock `unkernel.wasm` from the npm package | 10,165,321 |
-| kernel fork: `KWEMU_JIT=0` + a config trimmed to this app | 6,069,048 (bundled) |
-| drop sections it never reads, keep only the 9 exports the host uses | |
-| initrd from init + kwtty + the server (no busybox base image) | 5,259,297 |
-| `wasm-opt -Oz --closed-world --remove-unused-module-elements` | 4,438,054 |
+| kernel fork: `KWEMU_JIT=0`, `-Os`, a 16 KiB printk ring, and a config trimmed to this app | 4,969,494 (bundled) |
+| drop sections it never reads, keep only the 9 exports the host uses, and build the initrd from init + kwtty + the server (no busybox base image) | 4,159,756 |
+| `wasm-opt -Oz --closed-world --remove-unused-module-elements` | 3,517,686 |
 | Worker script: the forked host instead of the SDK | 54,361 |
 
-That is **6.79 MB → 4.39 MB (−35%)** for this round and **11.55 MB →
-4.39 MB (−62%)** from the first deployment. Boot (local `cf dev`,
-`scripts/bench.mjs --cold`): **~320 ms → ~70 ms** (median); warm `GET /health`
-p50 **~1.9 ms**, p99 ~2.8 ms.
+That is **6.79 MB → 3.49 MB (−49%)** for this round and **11.55 MB →
+3.49 MB (−70%)** from the first deployment. Boot (local `cf dev`,
+`scripts/bench.mjs --cold`): **~320 ms → ~60–70 ms** (median); warm `GET /health`
+p50 **~2 ms**, p99 ~2.8 ms (a rare ~3 s isolate wedge is replayed, see Notes).
 
 ### The specialized kernel
 
@@ -151,9 +150,9 @@ tokio, hyper and all — with no kernel and no interpreter:
 
 | | kernel + kwemu (shipped) | AOT of this binary |
 | --- | --- | --- |
-| module | 4,438,054 B | 4,462,977 B |
+| module | 3,517,686 B | 4,462,977 B → 3,318,937 B (wasm-opt) |
 | upload raw / gzip | 4,387 KiB / 1,740 KiB | 4,436 KiB / **1,344 KiB** |
-| boot to "listening" | ~70 ms | **~11 ms** (workerd, 200 boots; 6 ms Node) |
+| boot to "listening" | ~65 ms | **~11 ms** (workerd, 200 boots; 6 ms Node) |
 | warm `/health` p50 / p99 | ~1.9 / ~2.8 ms | **0.86 / 2.64 ms** |
 | guest work per request | — | **~103 µs** |
 | correctness evidence | real Linux kernel | 19/19 differential guests byte-identical, 2,000 requests 0 failures |
@@ -252,7 +251,7 @@ curl -X POST --data 'hi' http://localhost:8787/echo
 # hi
 ```
 
-The first request boots the kernel (~70 ms). Requests after that are a few
+The first request boots the kernel (~65 ms). Requests after that are a few
 milliseconds. The guest's boot log goes to the Worker logs.
 
 ## Deploy
