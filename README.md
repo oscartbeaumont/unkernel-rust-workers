@@ -163,12 +163,14 @@ request could share a turn. 32 guest calls from one context take ~13 ms, so
 the guest is not the limit; the remaining cost is the interpreter and the
 per-turn poll, not the queue.
 
-Every response carries `x-unkernel-queue-ms` (time waiting for a turn),
-`x-unkernel-ttfb-ms` (turn start to the guest's response head) and
-`x-unkernel-batch` (how many requests that turn carried), so a client can
-separate the Worker's share from the edge's. At 400 requests, 8-deep, against
-the deployed Worker they were p99 **16 ms** and **0–5 ms**, while the client
-saw 63 ms p50: most of that is TLS/edge/client, not the VM.
+Every response carries a standard `Server-Timing` header:
+`unkernel-queue` (time waiting for a turn), `unkernel-ttfb` (turn start to
+the guest's response head), `unkernel-body` (head to buffered body end) and
+`unkernel-batch` (how many requests that turn carried, as its description).
+Chrome's DevTools renders them under Network → Timing → Server Timing, and
+`PerformanceServerTiming` exposes them to code. At 400 requests, 8-deep,
+against the deployed Worker the first two were p99 **16 ms** and **0–5 ms**,
+while the client saw 63 ms p50: most of that is TLS/edge/client, not the VM.
 
 A slow client on a buffered body no longer holds the VM, so a download only
 delays the requests behind it when it is larger than the buffer cap (it then

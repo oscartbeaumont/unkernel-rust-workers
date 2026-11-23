@@ -61,6 +61,8 @@ interface Served {
   stream?: ReadableStream<Uint8Array> | null;
   /** Time from the turn starting to the response head (diagnostics). */
   ttfbMs: number;
+  /** Time from the response head to the buffered body ending; null when it streams. */
+  bodyMs: number | null;
 }
 
 /** What runJob() decided for one job. */
@@ -314,16 +316,21 @@ async function runJob(
     throw e;
   }
 
-  const ttfbMs = Date.now() - startedAt;
+  const headAt = Date.now();
+  const ttfbMs = headAt - startedAt;
   const headers = new Headers(r.headers);
-  const served = (bytes: Uint8Array<ArrayBuffer> | null, stream?: ReadableStream<Uint8Array>): RunResult => ({
+  const served = (
+    bytes: Uint8Array<ArrayBuffer> | null,
+    bodyMs: number | null,
+    stream?: ReadableStream<Uint8Array>,
+  ): RunResult => ({
     kind: stream ? "stream" : "buffered",
-    served: { status: r.status, statusText: r.statusText, headers, bytes, stream, ttfbMs },
+    served: { status: r.status, statusText: r.statusText, headers, bytes, stream, ttfbMs, bodyMs },
   });
 
   // HEAD has no body; 204/304 responses have none either.
   if (job.method === "HEAD" || r.body === null) {
-    return served(new Uint8Array(0));
+    return served(new Uint8Array(0), 0);
   }
 
   const length = r.headers.get("content-length");
@@ -331,7 +338,7 @@ async function runJob(
   if (isSelf && (declared === null || declared > MAX_BATCH_BYTES)) {
     // The driver's client can take a stream; a body that does not fit cannot
     // be handed to anyone else, so the turn keeps the VM until it ends.
-    return served(null, r.body);
+    return served(null, null, r.body);
   }
   if (declared === null || declared > MAX_BATCH_BYTES) {
     // Safe by construction (only GET/HEAD/OPTIONS are batched), so this job
@@ -344,7 +351,7 @@ async function runJob(
     if (isSelf) throw new Error("response exceeded the batch cap despite Content-Length");
     return { kind: "defer" };
   }
-  return served(bytes);
+  return served(bytes, Date.now() - headAt);
 }
 
 /** Read a body up to `cap` bytes; null (and cancel) if it is larger. */
@@ -542,9 +549,15 @@ function respond(job: Job): Response {
   if (!r || job.error) return error(502, job.error ?? new Error("empty response"));
 
   const headers = new Headers(r.headers);
-  headers.set("x-unkernel-queue-ms", String(r.queueMs));
-  headers.set("x-unkernel-ttfb-ms", String(r.ttfbMs));
-  headers.set("x-unkernel-batch", String(r.batch));
+  // Server-Timing is what Chrome's DevTools renders (Network -> Timing ->
+  // Server Timing); a custom header would only be visible to code.
+  const timing = [
+    `unkernel-queue;dur=${r.queueMs};desc="waiting for a turn"`,
+    `unkernel-ttfb;dur=${r.ttfbMs};desc="guest response head"`,
+  ];
+  if (r.bodyMs !== null) timing.push(`unkernel-body;dur=${r.bodyMs};desc="guest response body"`);
+  timing.push(`unkernel-batch;desc="${r.batch} request${r.batch === 1 ? "" : "s"}"`);
+  headers.set("server-timing", timing.join(", "));
 
   if (r.stream) {
     // A streamed body keeps the VM until it ends (driveTurn's trace).
