@@ -497,6 +497,17 @@ class Connection implements VsockConnection {
 		});
 	}
 
+	/** Debug: what this connection is waiting for (a snapshot of its counters). */
+	debug(): Record<string, unknown> {
+		return {
+			key: this.key, state: this.state,
+			rx: this.#rx.length, rxBytes: this.#rxBytes, wantRead: this.#wantRead, readDone: this.#readDone,
+			tx: this.#tx.length, peerBufAlloc: this.#peerBufAlloc, peerFwdCnt: this.#peerFwdCnt, txCnt: this.#txCnt,
+			credit: this.#credit(), shutSent: this.#shutSent, peerShutRcv: this.#peerShutRcv, peerShutSend: this.#peerShutSend,
+			closeWanted: this.#closeWanted, creditAsked: this.#creditAsked, reset: this.#resetErr?.code,
+		};
+	}
+
 	get key(): string {
 		return `${this.localPort}:${this.remotePort}`;
 	}
@@ -1015,6 +1026,14 @@ export class VsockHost implements Vsock {
 		c.receive({ ...h, op: VSOCK_OP_CREDIT_UPDATE }, pkt); // the guest's credit
 		this.sendPacket(encodeVsockPacket(c.header(VSOCK_OP_RESPONSE)));
 		l.offer(c);
+	}
+
+	/** Debug: every connection's state (nothing while the host is down). */
+	debug(): unknown {
+		return {
+			guestCid: this.guestCid, maxPayload: this.maxPayload, down: this.#down,
+			connections: [...this.#conns.values()].map((c) => c.debug()),
+		};
 	}
 
 	/** The kernel exited: every connection ends (ECONNABORTED), listeners return null. */

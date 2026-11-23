@@ -49,7 +49,7 @@ request ──► worker (Cloudflare Workers, TS)
 ## Bundle size and startup
 
 The deployed bundle is one wasm module (3.52 MB) plus the Worker script
-(54 KB): **3,489 KiB raw / 1,582 KiB gzip** (`cf deploy --dry-run`).
+(56 KB): **3,490 KiB raw / 1,583 KiB gzip** (`cf deploy --dry-run`).
 
 | step | bytes |
 | --- | --- |
@@ -57,12 +57,13 @@ The deployed bundle is one wasm module (3.52 MB) plus the Worker script
 | kernel fork: `KWEMU_JIT=0`, `-Os`, a 16 KiB printk ring, and a config trimmed to this app | 4,969,494 (bundled) |
 | drop sections it never reads, keep only the 9 exports the host uses, and build the initrd from init + kwtty + the server (no busybox base image) | 4,159,756 |
 | `wasm-opt -Oz --closed-world --remove-unused-module-elements` | 3,517,686 |
-| Worker script: the forked host instead of the SDK | 54,361 |
+| Worker script: the forked host instead of the SDK | 56,545 |
 
 That is **6.79 MB → 3.49 MB (−49%)** for this round and **11.55 MB →
 3.49 MB (−70%)** from the first deployment. Boot (local `cf dev`,
 `scripts/bench.mjs --cold`): **~320 ms → ~60–70 ms** (median); warm `GET /health`
-p50 **~2 ms**, p99 ~2.8 ms (a rare ~3 s isolate wedge is replayed, see Notes).
+p50 **~1.6 ms**, p99 ~7 ms (400 sequential, no stalls). Concurrent requests
+share the one VM through a fair lease (see [Concurrency](#concurrency)).
 
 ### The specialized kernel
 
@@ -109,7 +110,7 @@ fork in `sdk/` keeps the kernel's runtime (WASI clocks and randomness,
 console, task switching, vsock, kwtty, HTTP/1.1) and answers the other device
 imports like the SDK's *disabled* hosts do (`-ENODEV`, benign 0), so the guest
 registers no device and never reaches them. The script goes from 205 KB to
-54 KB and the isolate has nothing to construct at boot.
+~56 KB and the isolate has nothing to construct at boot.
 
 ### Startup
 
@@ -119,6 +120,36 @@ while the guest is still booting, so the first connection is refused: the
 fork retries every 5 ms instead of the upstream 100 ms (`sdk/tty.ts`), which
 is ~85 ms of the cold start. The readiness probe backs off 2 → 100 ms instead
 of a fixed 150 ms poll.
+
+### Concurrency
+
+One VM is shared by every request in the isolate (one boot, not one VM per
+request). Because the guest is a single-threaded Linux server, requests go
+through a fair FIFO lease: a request owns the guest from just before its vsock
+connection opens until its response body ends, and waiters poll with short
+timers. That is not only a throughput choice. The kernel makes progress inside
+whichever request is driving it, and the runtime's promise rules make a
+request's continuation unsafe when another request's turn settles it: with
+several requests driving one guest, workerd aborts the batch with *"Promise
+will never complete"* as soon as a timer fires. The lease keeps every
+suspension and continuation inside the request that owns the guest; waiters use
+timers rather than a promise chain for the same reason (workerd cancels a
+request that awaits a promise only another request can settle).
+
+Measured locally (`cf dev`, 400–800 requests each, `GET /health`, zero
+failures):
+
+| concurrency | p50 | p99 | max |
+| --- | --- | --- | --- |
+| 1 (sequential) | 1.6 ms | 7.4 ms | 21 ms |
+| 8 | 19 ms | 28 ms | 31 ms |
+| 32 | 82 ms | 173 ms | 177 ms |
+
+The guest serves one request in about 1.5–2 ms on the interpreter, so the
+ceiling is ~500 requests/s per isolate; a 32-deep burst is spread over that
+rate instead of failing. A request that streams a large body holds the lease
+until the client finishes or disconnects, so a slow download delays the
+requests behind it: with one VM, correctness wins over interleaving.
 
 ### Measured dead ends
 
@@ -151,7 +182,7 @@ tokio, hyper and all — with no kernel and no interpreter:
 | | kernel + kwemu (shipped) | AOT of this binary |
 | --- | --- | --- |
 | module | 3,517,686 B | 4,462,977 B → 3,318,937 B (wasm-opt) |
-| upload raw / gzip | 4,387 KiB / 1,740 KiB | 4,436 KiB / **1,344 KiB** |
+| upload raw / gzip | 3,490 KiB / 1,583 KiB | 4,436 KiB / **1,344 KiB** |
 | boot to "listening" | ~65 ms | **~11 ms** (workerd, 200 boots; 6 ms Node) |
 | warm `/health` p50 / p99 | ~1.9 / ~2.8 ms | **0.86 / 2.64 ms** |
 | guest work per request | — | **~103 µs** |
@@ -262,7 +293,7 @@ npx cf auth login   # once
 npx cf deploy
 ```
 
-The deploy uploads ~4.4 MB of wasm and ~0.05 MB of script (well within the
+The deploy uploads ~3.5 MB of wasm and ~0.06 MB of script (well within the)
 Workers size limit); the kernel is an imported module, never served as a
 static asset.
 
@@ -270,18 +301,21 @@ static asset.
 
 - One kernel per isolate, booted on the first request. After the isolate is
   evicted, the next request boots a fresh one.
-- **Rare lost wakeups.** The kernel occasionally stops serving a long-lived
-  isolate (a few in every few hundred requests in local runs; it reproduces
-  with the stock kernel and unmodified SDK, so it is not the fork or the
-  trimming). The Worker bounds it: a guest request that has not answered in
-  3 s recycles the VM and replays the request once on a fresh kernel, so the
-  cost is one ~3 s request rather than a dead isolate. `recycle()` in
-  `worker/index.ts`.
+- **The 3 s stalls are fixed.** A rare stall came from resuming a JSPI
+  stack synchronously inside another wasm import (`wasm_switch_to`'s
+  `resume(prev)` and the poll wake in `sdk/kernel.ts`): under workerd, V8
+  could lose the continuation, leaving the guest's scheduler parked with a
+  vsock IRQ pending and no progress. Both resumes now run on a microtask.
+  Measured: 0 stalls in 400 sequential and 2,000 concurrent requests (was a
+  few per few hundred, each 3 s). The Worker still bounds a guest that stops
+  answering: no first byte in 3 s recycles the VM and replays once, with a
+  keepalive timer so the runtime does not treat the replay as hung. The
+  timeout covers time to first byte, not the body.
 - Connections cannot be pooled across requests: a stream opened in one
   request cannot be read in another (workerd cancels the request as hung),
-  so every request opens its own kwtty/vsock connection. A reused connection
-  is 4–5× cheaper in the guest (0.11 ms vs 0.55 ms for `/health`), but it is
-  not available here.
+  so every request opens its own kwtty/vsock connection. The lease means one
+  connection is open at a time anyway. A reused connection is 4–5× cheaper in
+  the guest (0.11 ms vs 0.55 ms for `/health`), but it is not available here.
 - The default guest image has no shell (`vm.exec()` would fail); the Worker
   only needs `createKernel`, `spawn`, `connect` and `fetch`. `WITH_SHELL=1`
   builds the debugging image that has one.
@@ -289,8 +323,11 @@ static asset.
   allow dynamic wasm compilation. Startup and the axum server are well
   within the 30 s per-request CPU budget.
 - `compatibilityFlags: ["no_handle_cross_request_promise_resolution"]`
-  is required: the kernel's promise chains (JSPI wakeups) must resolve
-  across requests, not only inside the request that created them.
+  is required: the kernel boots in the first request that runs it, and its
+  JSPI promise chains settle in later requests. The default handling would
+  drop those continuations once the boot request ends. The lease keeps every
+  request's own continuations inside its turn, so the legacy behavior is safe
+  here; it is what lets the shared kernel outlive its first request.
 - The guest runs the usual unkernel limitations (e.g. no SMP, no inbound
   connections); nothing more is done here than the SDK supports.
 

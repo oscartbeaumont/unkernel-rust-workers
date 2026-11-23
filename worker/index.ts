@@ -28,18 +28,60 @@ interface Guest {
   vm: KernelInstance;
 }
 
-/** A guest request with no response by then marks this VM dead (see recycle()). */
+/** The part of Cloudflare's ExecutionContext this Worker uses. */
+interface ExecutionContextLike {
+  waitUntil(promise: Promise<unknown>): void;
+}
+
+/** No response head by then marks this VM dead (see recycle()). Bodies are not bounded. */
 const GUEST_TIMEOUT_MS = 3000;
 
 let guest: Guest | undefined;
 let bootPromise: Promise<Guest> | undefined;
 
 /**
+ * The one VM is a single-threaded Linux guest, and (more importantly) its
+ * progress is driven by whichever request is running the kernel. A request
+ * whose promise is resolved while *another* request drives the guest can have
+ * its continuation dropped by the runtime ("Promise will never complete"), so
+ * exactly one request owns the guest at a time: from before its connection is
+ * opened until its response body has ended.
+ *
+ * Waiters poll with a short timer rather than awaiting a promise another
+ * request resolves: the runtime cancels a request that waits on a promise only
+ * another request can settle (and the waiter stays in its own request context).
+ */
+let nextTicket = 0;
+let serving = 0;
+let leaseOwner: number | null = null;
+
+async function acquireGuest(): Promise<() => void> {
+  const ticket = nextTicket++;
+  for (;;) {
+    const ahead = ticket - serving;
+    if (leaseOwner === null && ahead === 0) break;
+    // The next in line checks at once; the ones behind it back off (a
+    // handoff is then at most a couple of milliseconds, and a 32-deep queue
+    // does not spin 32 timers).
+    const delay = ahead <= 0 ? 1 : Math.min(1 << Math.min(ahead, 3), 8);
+    await new Promise<void>((r) => setTimeout(r, delay));
+  }
+  serving++;
+  leaseOwner = ticket;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    leaseOwner = null;
+  };
+}
+
+/**
  * The one boot of this isolate. Every caller gets the same promise; a boot
  * that fails is dropped so the next request tries again instead of awaiting
  * a failure forever.
  */
-function ensureBoot(): Promise<Guest> {
+function ensureBoot(ctx: ExecutionContextLike): Promise<Guest> {
   if (guest) return Promise.resolve(guest);
   if (!bootPromise) {
     const p = boot().then((g) => {
@@ -47,6 +89,9 @@ function ensureBoot(): Promise<Guest> {
       return g;
     });
     bootPromise = p;
+    // A boot is ~60-85 ms, but keep it alive if this request is cancelled:
+    // otherwise its continuations are dropped and bootPromise never settles.
+    ctx.waitUntil(p.then(() => {}, () => {}));
     // Handle the rejection so a boot that fails before a caller awaits it
     // does not surface as an unhandled rejection.
     p.catch(() => {
@@ -57,10 +102,9 @@ function ensureBoot(): Promise<Guest> {
 }
 
 /**
- * Drop a VM that stopped answering. The guest occasionally stops serving a
- * long-lived isolate (kwtty stops accepting; see the wedge notes in the
- * README): a request that timed out gets a 502, and the next one boots a
- * fresh kernel (~85 ms) instead of the isolate failing for good.
+ * Drop a VM that stopped answering. A guest that has not started a response in
+ * GUEST_TIMEOUT_MS is replaced: the timed-out request is replayed on the new
+ * kernel (~85 ms), and the queued requests wait for that instead of failing.
  */
 function recycle(g: Guest, why: string): void {
   if (guest !== g) return; // already replaced by another request
@@ -157,7 +201,13 @@ async function drain(stream: ReadableStream<Uint8Array>, name: string): Promise<
 }
 
 export default {
-  async fetch(request: Request): Promise<Response> {
+  async fetch(request: Request, _env: unknown, ctx: ExecutionContextLike): Promise<Response> {
+    const url0 = new URL(request.url);
+    // Diagnostics: the VM's state, answered by the Worker (never by the guest),
+    // so it works while the guest is stalled.
+    if (url0.pathname === "/__debug") {
+      return Response.json(guest ? guest.vm.debug() : { guest: null }, { headers: { "cache-control": "no-store" } });
+    }
     // The guest runs the server on its loopback port; forward the path and
     // query, and let the guest see a normal Host header. One connection per
     // request: a stream opened in one request cannot be read in another (the
@@ -169,28 +219,81 @@ export default {
     // Buffered so a request that found the guest unresponsive can be replayed.
     const body = request.body ? await request.arrayBuffer() : undefined;
 
+    // Armed only when an attempt times out; it outlives that attempt so the
+    // runtime has a pending event while the VM is recycled and replayed.
+    let keepalive: ReturnType<typeof setTimeout> | undefined;
+    const stopKeepalive = () => {
+      if (keepalive !== undefined) {
+        clearTimeout(keepalive);
+        keepalive = undefined;
+      }
+    };
+
     for (let attempt = 0; ; attempt++) {
+      const release = await acquireGuest();
       let g: Guest;
       try {
-        g = await ensureBoot();
+        g = await ensureBoot(ctx);
       } catch (e) {
-        // A failed boot must not poison the isolate: retry on the next request.
+        // A failed boot must not poison the isolate: the next request tries
+        // again (it holds the lease, so only one boot runs at a time).
+        release();
         return error(500, e);
       }
-      const timeout = AbortSignal.timeout(GUEST_TIMEOUT_MS);
+
+      // The timeout bounds time to first byte, not the body: a large download
+      // may take as long as its client needs. While the timeout's abort,
+      // recycle and replay run, a second timer keeps the runtime from
+      // declaring the request hung (no pending I/O is left once the first
+      // one fires).
+      const controller = new AbortController();
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        keepalive = setTimeout(() => {}, 2 * GUEST_TIMEOUT_MS);
+        controller.abort();
+      }, GUEST_TIMEOUT_MS);
+      let released = false;
+      const releaseOnce = () => {
+        clearTimeout(timer);
+        if (released) return;
+        released = true;
+        release();
+      };
+
       try {
-        return await g.vm.fetch(guestUrl, {
+        const r = await g.vm.fetch(guestUrl, {
           method: request.method,
           headers,
           body,
-          signal: AbortSignal.any([request.signal, timeout]),
+          signal: AbortSignal.any([request.signal, controller.signal]),
+        }, {
+          head: () => clearTimeout(timer),
+          finished: releaseOnce,
         });
+        stopKeepalive();
+        // A response body holds the lease until it ends (fetchOver calls
+        // finished); a body-less response is complete already.
+        if (!r.body) releaseOnce();
+        return r;
       } catch (e) {
-        // The guest stopped answering (a rare lost wakeup in the kernel/engine
+        releaseOnce();
+        // The guest stopped answering (a lost wakeup in the kernel/engine
         // pairing): replace the VM and replay once on the fresh one.
-        if (!timeout.aborted || request.signal.aborted || attempt > 0) {
+        if (!timedOut || request.signal.aborted || attempt > 0) {
+          stopKeepalive();
           return error(502, e);
         }
+        // The keepalive timer stays armed through the recycle and replay (it
+        // is what keeps the runtime from abandoning the replay); the retry's
+        // success or terminal error clears it.
+        const s = g.vm.debug() as Record<string, unknown>;
+        console.error("[unkernel-rs] guest timeout " + JSON.stringify({
+          idle: s.idle, irqs: s.irqs, stats: s.stats,
+          queued: (s.vsockDevice as { queued?: number } | undefined)?.queued,
+          conns: (s.vsock as { connections?: Array<Record<string, unknown>> } | undefined)?.connections
+            ?.map((c) => ({ k: c.key, s: c.state, rx: c.rx, tx: c.tx, want: c.wantRead, shut: c.shutSent, peer: c.peerShutSend })),
+        }));
         recycle(g, `no response within ${GUEST_TIMEOUT_MS} ms`);
       }
     }

@@ -287,7 +287,10 @@ export class Kernel {
 	wake(): void {
 		const w = this.idleWake;
 		this.idleWake = null;
-		if (w) w();
+		// Resume the parked stack on a microtask, not inside whatever import or
+		// callback raised the IRQ: a JSPI stack must not be resumed from within
+		// another stack's execution (the same rule as wasm_switch_to's resume).
+		if (w) queueMicrotask(w);
 	}
 
 	/**
@@ -370,7 +373,10 @@ export class Kernel {
 						k.fatal(`switch to unknown task 0x${next.toString(16)}`);
 					} else {
 						k.resumers.delete(next);
-						resume(prev);
+						// Resume on a microtask, not inside this wasm import: V8's
+						// stack switching must not run one suspended stack from
+						// within another's import (a rare wedge, see README).
+						queueMicrotask(() => resume(prev));
 					}
 				}
 				return parked;

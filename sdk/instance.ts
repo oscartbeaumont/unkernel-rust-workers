@@ -24,7 +24,7 @@ import {
 	type AttachOptions, type ConnectOptions, type ExecOptions, type ExecResult,
 	type GuestSocket, type PipeOptions, type Pty, type PtyOptions, type Subprocess,
 } from "./tty.ts";
-import { fetchOver } from "./http.ts";
+import { fetchOver, type FetchTrace } from "./http.ts";
 
 /** What the platform supplies: the kernel and its memory defaults. */
 export interface Platform {
@@ -137,8 +137,8 @@ export class KernelInstance {
 	}
 
 	/** HTTP/1.1 to a server on the guest's loopback (http.ts fetchOver()). */
-	fetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
-		return fetchOver((port, o) => this.connect(port, o), input, init);
+	fetch(input: string | URL | Request, init?: RequestInit, trace?: FetchTrace): Promise<Response> {
+		return fetchOver((port, o) => this.connect(port, o), input, init, trace);
 	}
 
 	/** Console output as a stream: the first access gets everything since boot; closes at exit. */
@@ -192,6 +192,23 @@ export class KernelInstance {
 			cpus: 1,
 			compileMs: 0,
 			vsock: this.#vsock ? { ...this.#vsock.stats } : undefined,
+		};
+	}
+
+	/** Debug: what the kernel and its vsock are doing now (for the wedge diagnosis). */
+	debug(): Record<string, unknown> {
+		const k = this.kernel;
+		let irqs: number | null = null;
+		try {
+			if (k.irqAddr !== undefined) irqs = new DataView(k.memory.buffer).getUint32(k.irqAddr, true);
+		} catch {}
+		return {
+			result: k.result ?? null,
+			idle: k.idleWake !== null,
+			irqs,
+			stats: { ...k.stats },
+			vsockDevice: { queued: k.vsock.queued },
+			vsock: this.#vsock?.debug() ?? null,
 		};
 	}
 

@@ -24,6 +24,14 @@ export interface ByteDuplex {
 /** Open a byte stream to the guest's 127.0.0.1:<port>. */
 export type GuestConnect = (port: number, opts: { signal?: AbortSignal }) => Promise<ByteDuplex>;
 
+/** Optional observation of one fetch (never part of the Response). */
+export interface FetchTrace {
+	/** The response head arrived: the fetch is no longer waiting for the guest. */
+	head?: (status: number) => void;
+	/** The fetch is over: the body ended, it failed or it was cancelled. Called once. */
+	finished?: () => void;
+}
+
 /** The largest status line plus header block accepted, interim responses included. */
 export const HTTP_MAX_HEADER_BYTES = 64 * 1024;
 
@@ -184,7 +192,7 @@ function signalReason(signal: AbortSignal): unknown {
  * a ReadableStream (or other streaming) `init.body` is sent chunked.
  * Redirects are returned, not followed. Rejects 101 Switching Protocols.
  */
-export async function fetchOver(connect: GuestConnect, input: string | URL | Request, init?: RequestInit): Promise<Response> {
+export async function fetchOver(connect: GuestConnect, input: string | URL | Request, init?: RequestInit, trace?: FetchTrace): Promise<Response> {
 	const streaming = init?.body != null && !knownLength(init.body);
 	const req = new Request(input, streaming && !("duplex" in init!) ? ({ ...init, duplex: "half" } as RequestInit) : init);
 	const url = new URL(req.url);
@@ -231,7 +239,6 @@ export async function fetchOver(connect: GuestConnect, input: string | URL | Req
 	} finally {
 		signal.removeEventListener("abort", onConnectAbort);
 	}
-
 	const writer = duplex.writable.getWriter();
 	const reader = duplex.readable.getReader();
 	const conn = new Input(reader);
@@ -250,6 +257,9 @@ export async function fetchOver(connect: GuestConnect, input: string | URL | Req
 		if (error === undefined && uploadDone) writer.close().catch(noop);
 		else writer.abort(error).catch(noop);
 		reader.cancel(error).catch(noop);
+		// Last: the caller's lease is only released after the connection's
+		// close has been started (the close itself may queue vsock packets).
+		trace?.finished?.();
 	};
 	const fail = (e: unknown) => {
 		if (finished) return;
@@ -305,6 +315,7 @@ export async function fetchOver(connect: GuestConnect, input: string | URL | Req
 			if (res.status >= 200) break;
 		}
 		if (res.status > 599) throw malformed(`status ${res.status}`);
+		trace?.head?.(res.status);
 		body = framing(method, res.status, res.headers);
 	} catch (e) {
 		fail(e);
