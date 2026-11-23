@@ -9,7 +9,7 @@ export default defineConfig({
 		// requests. The default handling would drop them once the boot request
 		// ends, so this VM needs the legacy cross-request behavior. Requests
 		// never wait on a promise another request resolves (worker/index.ts's
-		// lease plus timer polling), so the legacy behavior is safe here.
+		// batched turns plus timer polling), so the legacy behavior is safe here.
 		compatibilityFlags: [
 			"no_handle_cross_request_promise_resolution",
 		],

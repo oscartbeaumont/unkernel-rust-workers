@@ -57,13 +57,13 @@ The deployed bundle is one wasm module (3.52 MB) plus the Worker script
 | kernel fork: `KWEMU_JIT=0`, `-Os`, a 16 KiB printk ring, and a config trimmed to this app | 4,969,494 (bundled) |
 | drop sections it never reads, keep only the 9 exports the host uses, and build the initrd from init + kwtty + the server (no busybox base image) | 4,159,756 |
 | `wasm-opt -Oz --closed-world --remove-unused-module-elements` | 3,517,686 |
-| Worker script: the forked host instead of the SDK | 56,545 |
+| Worker script: the forked host instead of the SDK | 59,320 |
 
 That is **6.79 MB → 3.49 MB (−49%)** for this round and **11.55 MB →
 3.49 MB (−70%)** from the first deployment. Boot (local `cf dev`,
 `scripts/bench.mjs --cold`): **~320 ms → ~60–70 ms** (median); warm `GET /health`
-p50 **~1.6 ms**, p99 ~7 ms (400 sequential, no stalls). Concurrent requests
-share the one VM through a fair lease (see [Concurrency](#concurrency)).
+p50 **~1.7 ms**, p99 ~7 ms (400 sequential, no stalls). Concurrent requests
+share the one VM through batched turns (see [Concurrency](#concurrency)).
 
 ### The specialized kernel
 
@@ -124,38 +124,56 @@ of a fixed 150 ms poll.
 ### Concurrency
 
 One VM is shared by every request in the isolate (one boot, not one VM per
-request). Because the guest is a single-threaded Linux server, requests go
-through a fair FIFO lease: a request owns the guest from just before its vsock
-connection opens until its response body ends, and waiters poll with short
-timers. That is not only a throughput choice. The kernel makes progress inside
-whichever request is driving it, and the runtime's promise rules make a
-request's continuation unsafe when another request's turn settles it: with
-several requests driving one guest, workerd aborts the batch with *"Promise
-will never complete"* as soon as a timer fires. The lease keeps every
-suspension and continuation inside the request that owns the guest; waiters use
-timers rather than a promise chain for the same reason (workerd cancels a
-request that awaits a promise only another request can settle).
+request), but only one *request context* at a time may drive it. The kernel is
+one suspended wasm stack, and workerd ties the continuations that resume it to
+the request that created them: with two requests driving, workerd aborts the
+batch with *"Promise will never complete"* as soon as a timer fires. The unit
+of scheduling is therefore a **turn**, not a request.
 
-Measured locally (`cf dev`, 400–800 requests each, `GET /health`, zero
-failures):
+A turn's driver is the request at the head of the queue. When that request is
+safe (GET/HEAD/OPTIONS without a body, so it can be retried), the driver runs
+up to 16 guest connections concurrently in its own context — what the guest's
+own async server does natively, and what workerd permits within one request.
+Responses up to 256 KiB are buffered, handed to their waiters as plain values,
+and the VM is released as soon as the last one is read: a slow client no
+longer keeps the VM while it reads. The requests behind the driver poll their
+own job with a short timer; they never await a promise that another request
+resolves, which workerd cancels.
+
+Unsafe methods (POST/PUT/PATCH/DELETE) keep the exclusive lane and are never
+batched, because a response too large to buffer cannot be replayed without
+duplicating the request's effect. A safe request whose response is too large
+is deferred to a turn of its own, where it streams. The same applies to the
+driver's own body: a small response is buffered, a large one streams and holds
+the VM until the client is done, which is the one remaining head-of-line case.
+
+Measured locally (`cf dev`, 800 requests each, `GET /health`, zero failures):
 
 | concurrency | p50 | p99 | max |
 | --- | --- | --- | --- |
-| 1 (sequential) | 1.6 ms | 7.4 ms | 21 ms |
-| 8 | 19 ms | 28 ms | 31 ms |
-| 32 | 82 ms | 173 ms | 177 ms |
+| 1 (sequential) | 1.7 ms | 7.3 ms | 22 ms |
+| 8 | 7.1 ms | 15.6 ms | 22 ms |
+| 16 | 12.9 ms | 27.8 ms | 30 ms |
+| 32 | 23 ms | 47 ms | 48 ms |
+| 64 | 44 ms | 71 ms | 72 ms |
 
-The guest serves one request in about 1.5–2 ms on the interpreter, so the
-ceiling is ~500 requests/s per isolate; a 32-deep burst is spread over that
-rate instead of failing. A request that streams a large body holds the lease
-until the client finishes or disconnects, so a slow download delays the
-requests behind it: with one VM, correctness wins over interleaving.
+The same runs with the previous per-request lease were 21 ms and 82 ms at
+8-deep and 32-deep, because every request paid a handoff (~1–2.5 ms) and no
+request could share a turn. 32 guest calls from one context take ~13 ms, so
+the guest is not the limit; the remaining cost is the interpreter and the
+per-turn poll, not the queue.
 
-Every response carries `x-unkernel-queue-ms` (time waiting for the lease) and
-`x-unkernel-ttfb-ms` (time from acquiring the guest to its response head), so
-a client can separate the Worker's share from the edge's. At 400 requests,
-8-deep, against the deployed Worker they were p99 **16 ms** and **0–5 ms**,
-while the client saw 63 ms p50: most of that is TLS/edge/client, not the VM.
+Every response carries `x-unkernel-queue-ms` (time waiting for a turn),
+`x-unkernel-ttfb-ms` (turn start to the guest's response head) and
+`x-unkernel-batch` (how many requests that turn carried), so a client can
+separate the Worker's share from the edge's. At 400 requests, 8-deep, against
+the deployed Worker they were p99 **16 ms** and **0–5 ms**, while the client
+saw 63 ms p50: most of that is TLS/edge/client, not the VM.
+
+A slow client on a buffered body no longer holds the VM, so a download only
+delays the requests behind it when it is larger than the buffer cap (it then
+streams from the turn that owns it). With one VM there is no way to run two
+turns at once; a second VM is the next step if that case matters.
 
 ### Measured dead ends
 
@@ -299,7 +317,7 @@ npx cf auth login   # once
 npx cf deploy
 ```
 
-The deploy uploads ~3.5 MB of wasm and ~0.06 MB of script (well within the)
+The deploy uploads ~3.5 MB of wasm and ~0.06 MB of script (well within the
 Workers size limit); the kernel is an imported module, never served as a
 static asset.
 
@@ -318,10 +336,10 @@ static asset.
   keepalive timer so the runtime does not treat the replay as hung. The
   timeout covers time to first byte, not the body.
 - Connections cannot be pooled across requests: a stream opened in one
-  request cannot be read in another (workerd cancels the request as hung),
-  so every request opens its own kwtty/vsock connection. The lease means one
-  connection is open at a time anyway. A reused connection is 4–5× cheaper in
-  the guest (0.11 ms vs 0.55 ms for `/health`), but it is not available here.
+  request cannot be read in another (workerd cancels the request as hung), so
+  each connection lives inside the turn that opened it. A turn can hold
+  several at once. A reused connection is 4–5× cheaper in the guest (0.11 ms
+  vs 0.55 ms for `/health`), but it is not available here.
 - The default guest image has no shell (`vm.exec()` would fail); the Worker
   only needs `createKernel`, `spawn`, `connect` and `fetch`. `WITH_SHELL=1`
   builds the debugging image that has one.
@@ -331,9 +349,9 @@ static asset.
 - `compatibilityFlags: ["no_handle_cross_request_promise_resolution"]`
   is required: the kernel boots in the first request that runs it, and its
   JSPI promise chains settle in later requests. The default handling would
-  drop those continuations once the boot request ends. The lease keeps every
-  request's own continuations inside its turn, so the legacy behavior is safe
-  here; it is what lets the shared kernel outlive its first request.
+  drop those continuations once the boot request ends. A turn keeps its own
+  continuations inside one request, so the legacy behavior is safe here; it is
+  what lets the shared kernel outlive its first request.
 - The guest runs the usual unkernel limitations (e.g. no SMP, no inbound
   connections); nothing more is done here than the SDK supports.
 

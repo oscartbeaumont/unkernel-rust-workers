@@ -12,6 +12,17 @@
  * async work, timers and random values in global scope ("Disallowed operation
  * called within global scope"), and the kernel needs random_get() to boot, so
  * an isolate cannot start the VM until a handler is running.
+ *
+ * One VM serves every request in the isolate, but only one request at a time
+ * may drive it: the kernel is one suspended wasm stack, and workerd ties the
+ * continuations that resume it to the request that created them. The unit of
+ * scheduling is therefore a turn, not a request. A turn's driver (the request
+ * at the head of the queue) runs a batch of guest connections concurrently in
+ * its own context, the way the guest's own async server would; the requests
+ * behind it poll for the buffered answers instead of driving the VM. That is
+ * both faster (one turn drains many requests) and safer (no continuation ever
+ * crosses a request boundary except the VM's own, which the compatibility
+ * flag covers). See README.md, "Concurrency".
  */
 
 import { createKernel } from "./kernel";
@@ -23,6 +34,12 @@ const GUEST_FILE = "/hello/axum-hello";
 const GUEST_PORT = 3000;
 /** How long the server may take to bind before boot is considered failed. */
 const READY_TIMEOUT_MS = 10000;
+/** No response head by then marks this VM dead (see recycle()). Bodies are not bounded. */
+const GUEST_TIMEOUT_MS = 3000;
+/** Requests one turn may serve at once, all driven from the same context. */
+const MAX_BATCH = 16;
+/** A response larger than this cannot be handed to another request, so it streams. */
+const MAX_BATCH_BYTES = 256 * 1024;
 
 interface Guest {
   vm: KernelInstance;
@@ -33,48 +50,83 @@ interface ExecutionContextLike {
   waitUntil(promise: Promise<unknown>): void;
 }
 
-/** No response head by then marks this VM dead (see recycle()). Bodies are not bounded. */
-const GUEST_TIMEOUT_MS = 3000;
+/** A response the guest produced for one job. */
+interface Served {
+  status: number;
+  statusText: string;
+  headers: Headers;
+  /** The buffered body, or null when `stream` carries it instead. */
+  bytes: Uint8Array<ArrayBuffer> | null;
+  /** The driver's own response body, still coming from the guest. */
+  stream?: ReadableStream<Uint8Array> | null;
+  /** Time from the turn starting to the response head (diagnostics). */
+  ttfbMs: number;
+}
+
+/** What runJob() decided for one job. */
+type RunResult =
+  | { kind: "buffered"; served: Served }
+  | { kind: "stream"; served: Served }
+  | { kind: "defer" }
+  | { kind: "aborted" };
+
+interface JobResult extends Served {
+  /** Time from enqueueing to the turn that served it starting (diagnostics). */
+  queueMs: number;
+  /** How many requests that turn carried (diagnostics). */
+  batch: number;
+}
+
+interface Job {
+  id: number;
+  method: string;
+  /** The guest URL (loopback, path and query from the client). */
+  url: string;
+  headers: Headers;
+  body?: ArrayBuffer;
+  /** The client's request signal: an abort drops the job from the queue. */
+  signal: AbortSignal;
+  queuedAt: number;
+  /** GET/HEAD/OPTIONS without a body: safe to batch and to retry. */
+  batchable: boolean;
+  attempts: number;
+  done: boolean;
+  result?: JobResult;
+  error?: unknown;
+}
 
 let guest: Guest | undefined;
 let bootPromise: Promise<Guest> | undefined;
 
 /**
- * The one VM is a single-threaded Linux guest, and (more importantly) its
- * progress is driven by whichever request is running the kernel. A request
- * whose promise is resolved while *another* request drives the guest can have
- * its continuation dropped by the runtime ("Promise will never complete"), so
- * exactly one request owns the guest at a time: from before its connection is
- * opened until its response body has ended.
- *
- * Waiters poll with a short timer rather than awaiting a promise another
- * request resolves: the runtime cancels a request that waits on a promise only
- * another request can settle (and the waiter stays in its own request context).
+ * The turn queue. Only the head may drive, and only while no turn is active;
+ * everyone else polls its own job with a short timer (a promise resolved by
+ * another request's turn is exactly what workerd cancels).
  */
-let nextTicket = 0;
-let serving = 0;
+let queue: Job[] = [];
 let leaseOwner: number | null = null;
+let nextJobId = 0;
+const turnStats = { turns: 0, batched: 0, requests: 0 };
 
-async function acquireGuest(): Promise<() => void> {
-  const ticket = nextTicket++;
-  for (;;) {
-    const ahead = ticket - serving;
-    if (leaseOwner === null && ahead === 0) break;
-    // The next in line checks at once; the ones behind it back off (a
-    // handoff is then at most a couple of milliseconds, and a 32-deep queue
-    // does not spin 32 timers).
-    const delay = ahead <= 0 ? 1 : Math.min(1 << Math.min(ahead, 3), 8);
-    await new Promise<void>((r) => setTimeout(r, delay));
-  }
-  serving++;
-  leaseOwner = ticket;
-  let released = false;
-  return () => {
-    if (released) return;
-    released = true;
-    leaseOwner = null;
-  };
+/**
+ * A request that only reads: running it with others is safe, and if its
+ * response cannot be buffered it can be replayed in its own turn. Unsafe
+ * methods keep the exclusive lane so a response that does not fit is never
+ * produced twice.
+ */
+function isBatchable(method: string, body: ArrayBuffer | undefined): boolean {
+  return (
+    (method === "GET" || method === "HEAD" || method === "OPTIONS") &&
+    (!body || body.byteLength === 0)
+  );
 }
+
+/** Polling backoff for waiters (ms): the head checks at once, the rest back off. */
+function pollDelay(polls: number): number {
+  return Math.min(1 + (polls >> 2), 4);
+}
+
+const noop = () => {};
 
 /**
  * The one boot of this isolate. Every caller gets the same promise; a boot
@@ -103,8 +155,8 @@ function ensureBoot(ctx: ExecutionContextLike): Promise<Guest> {
 
 /**
  * Drop a VM that stopped answering. A guest that has not started a response in
- * GUEST_TIMEOUT_MS is replaced: the timed-out request is replayed on the new
- * kernel (~85 ms), and the queued requests wait for that instead of failing.
+ * GUEST_TIMEOUT_MS is replaced: the turn is replayed once on the new kernel
+ * (~85 ms), and the queued requests wait for that instead of failing.
  */
 function recycle(g: Guest, why: string): void {
   if (guest !== g) return; // already replaced by another request
@@ -112,6 +164,214 @@ function recycle(g: Guest, why: string): void {
   bootPromise = undefined;
   console.error(`[unkernel-rs] recycling the guest VM: ${why}`);
   void g.vm.stop().catch(() => {});
+}
+
+/**
+ * Drive the head of the queue, and the batchable requests behind it, in this
+ * request's context.
+ *
+ * Every guest call here belongs to the same request, which is what workerd
+ * allows: one context may run many guest connections, two contexts may not
+ * share the VM. Jobs are answered with a plain value and their waiters poll
+ * for it; only the driver's own streaming body keeps the VM past this return.
+ */
+async function driveTurn(self: Job, ctx: ExecutionContextLike): Promise<void> {
+  leaseOwner = self.id;
+  // The driver's own body may still be streaming when the turn ends: hold the
+  // VM until its trace says the body ended (or the client went away).
+  const streamTrace = { hold: false, finished: false, released: false };
+  const release = () => {
+    if (streamTrace.released) return;
+    streamTrace.released = true;
+    leaseOwner = null;
+  };
+  let holdsLease = false;
+
+  try {
+    let g: Guest;
+    try {
+      g = await ensureBoot(ctx);
+    } catch (e) {
+      self.error = e;
+      self.done = true;
+      return;
+    }
+
+    const taken: Job[] = [self];
+    if (self.batchable) {
+      // Incoming requests reach the isolate one event-loop turn at a time, so
+      // the first job of a burst usually becomes the head alone. When others
+      // are already queued behind us, give the rest of the burst a millisecond
+      // to arrive: the head pays it once, and the batch serves them all. A
+      // lone request never waits.
+      if (queue.length > 1) await new Promise<void>((r) => setTimeout(r, 1));
+      for (let i = 1; i < queue.length && taken.length < MAX_BATCH; i++) {
+        const j = queue[i];
+        // Strict FIFO: an unsafe request ends the batch rather than being
+        // overtaken by the safe ones behind it.
+        if (!j.batchable || j.signal.aborted) break;
+        taken.push(j);
+      }
+    }
+    queue = queue.filter((j) => !taken.includes(j));
+
+    const startedAt = Date.now();
+    const settled = await Promise.allSettled(
+      taken.map((j) =>
+        runJob(j, g, j === self, startedAt, () => {
+          streamTrace.finished = true;
+          if (streamTrace.hold) release();
+        }),
+      ),
+    );
+    turnStats.turns++;
+    turnStats.requests += taken.length;
+    if (taken.length > 1) turnStats.batched++;
+
+    const failures = settled.filter((r) => r.status === "rejected");
+    if (failures.length === taken.length && !taken.every((j) => j.signal.aborted)) {
+      // Nothing in the turn answered: the VM is gone. Replace it and replay
+      // the turn once on the fresh kernel (the old per-request safety net).
+      if (self.attempts === 0) {
+        for (const j of taken) j.attempts++;
+        recycle(g, `no response within ${GUEST_TIMEOUT_MS} ms`);
+        queue.unshift(...taken.filter((j) => !j.signal.aborted));
+        if (self.signal.aborted) {
+          self.error = new Error("client disconnected");
+          self.done = true;
+        }
+        return;
+      }
+    }
+
+    const retry: Job[] = [];
+    for (let i = 0; i < taken.length; i++) {
+      const job = taken[i];
+      const r = settled[i];
+      if (r.status === "rejected") {
+        job.error = r.reason;
+        job.done = true;
+        continue;
+      }
+      const v = r.value;
+      if (v.kind === "aborted") {
+        job.error = new Error("client disconnected");
+        job.done = true;
+      } else if (v.kind === "defer") {
+        retry.push(job);
+      } else {
+        job.result = {
+          ...v.served,
+          queueMs: startedAt - job.queuedAt,
+          batch: taken.length,
+        };
+        job.done = true;
+        if (v.kind === "stream") {
+          // Only the driver's own job can stream; it keeps the VM until the
+          // body ends rather than buffering an arbitrarily large response.
+          holdsLease = true;
+        }
+      }
+    }
+    if (retry.length) queue.unshift(...retry);
+
+    if (holdsLease) {
+      streamTrace.hold = true;
+      // A short chunked body may already have ended while the batch ran.
+      if (streamTrace.finished) release();
+    }
+  } finally {
+    if (!holdsLease) release();
+  }
+}
+
+/**
+ * Run one job in the driver's context and decide how its response is handed
+ * over: buffered (a follower or a small body), streamed (the driver's own
+ * response), deferred (a safe request whose body is too large to buffer) or
+ * aborted.
+ */
+async function runJob(
+  job: Job,
+  g: Guest,
+  isSelf: boolean,
+  startedAt: number,
+  onFinished: () => void,
+): Promise<RunResult> {
+  const timeout = AbortSignal.timeout(GUEST_TIMEOUT_MS);
+  const signal = AbortSignal.any([job.signal, timeout]);
+  let r: Response;
+  try {
+    // A trace belongs to the driver's own job: it is the only body that can
+    // outlive the turn. Followers are read to the end here.
+    r = await g.vm.fetch(
+      job.url,
+      { method: job.method, headers: job.headers, body: job.body, signal },
+      isSelf ? { finished: onFinished } : undefined,
+    );
+  } catch (e) {
+    if (job.signal.aborted) return { kind: "aborted" };
+    throw e;
+  }
+
+  const ttfbMs = Date.now() - startedAt;
+  const headers = new Headers(r.headers);
+  const served = (bytes: Uint8Array<ArrayBuffer> | null, stream?: ReadableStream<Uint8Array>): RunResult => ({
+    kind: stream ? "stream" : "buffered",
+    served: { status: r.status, statusText: r.statusText, headers, bytes, stream, ttfbMs },
+  });
+
+  // HEAD has no body; 204/304 responses have none either.
+  if (job.method === "HEAD" || r.body === null) {
+    return served(new Uint8Array(0));
+  }
+
+  const length = r.headers.get("content-length");
+  const declared = length === null ? null : Number(length);
+  if (isSelf && (declared === null || declared > MAX_BATCH_BYTES)) {
+    // The driver's client can take a stream; a body that does not fit cannot
+    // be handed to anyone else, so the turn keeps the VM until it ends.
+    return served(null, r.body);
+  }
+  if (declared === null || declared > MAX_BATCH_BYTES) {
+    // Safe by construction (only GET/HEAD/OPTIONS are batched), so this job
+    // is replayed in a turn of its own, where it can stream to its client.
+    await r.body.cancel().catch(noop);
+    return { kind: "defer" };
+  }
+  const bytes = await readCapped(r.body, MAX_BATCH_BYTES);
+  if (!bytes) {
+    if (isSelf) throw new Error("response exceeded the batch cap despite Content-Length");
+    return { kind: "defer" };
+  }
+  return served(bytes);
+}
+
+/** Read a body up to `cap` bytes; null (and cancel) if it is larger. */
+async function readCapped(
+  body: ReadableStream<Uint8Array>,
+  cap: number,
+): Promise<Uint8Array<ArrayBuffer> | null> {
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > cap) {
+      await reader.cancel().catch(noop);
+      return null;
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
 }
 
 async function boot(): Promise<Guest> {
@@ -206,7 +466,21 @@ export default {
     // Diagnostics: the VM's state, answered by the Worker (never by the guest),
     // so it works while the guest is stalled.
     if (url0.pathname === "/__debug") {
-      return Response.json(guest ? guest.vm.debug() : { guest: null }, { headers: { "cache-control": "no-store" } });
+      return Response.json(
+        {
+          guest: guest ? guest.vm.debug() : null,
+          queue: queue.map((j) => ({
+            id: j.id,
+            method: j.method,
+            batchable: j.batchable,
+            ageMs: Date.now() - j.queuedAt,
+            attempts: j.attempts,
+          })),
+          leaseOwner,
+          turns: turnStats,
+        },
+        { headers: { "cache-control": "no-store" } },
+      );
     }
     // The guest runs the server on its loopback port; forward the path and
     // query, and let the guest see a normal Host header. One connection per
@@ -216,110 +490,77 @@ export default {
     const guestUrl = `http://localhost:${GUEST_PORT}${url.pathname}${url.search}`;
     const headers = new Headers(request.headers);
     headers.delete("host");
-    // Buffered so a request that found the guest unresponsive can be replayed.
+    // Buffered so a turn that finds the guest unresponsive can replay it, and
+    // so no request body is half-sent across a retry.
     const body = request.body ? await request.arrayBuffer() : undefined;
 
-    // Armed only when an attempt times out; it outlives that attempt so the
-    // runtime has a pending event while the VM is recycled and replayed.
-    let keepalive: ReturnType<typeof setTimeout> | undefined;
-    const stopKeepalive = () => {
-      if (keepalive !== undefined) {
-        clearTimeout(keepalive);
-        keepalive = undefined;
-      }
+    const job: Job = {
+      id: nextJobId++,
+      method: request.method,
+      url: guestUrl,
+      headers,
+      body,
+      signal: request.signal,
+      queuedAt: Date.now(),
+      batchable: isBatchable(request.method, body),
+      attempts: 0,
+      done: false,
     };
-
-    for (let attempt = 0; ; attempt++) {
-      const queuedAt = Date.now();
-      const release = await acquireGuest();
-      const acquiredAt = Date.now();
-      let ttfbAt = 0;
-      const noteSlow = (how: string) => {
-        const total = Date.now() - queuedAt;
-        if (total < 200) return;
-        console.log(`[slow] ${how} ` + JSON.stringify({ queue: acquiredAt - queuedAt, ttfb: ttfbAt ? ttfbAt - acquiredAt : null, total }));
-      };
-      let g: Guest;
-      try {
-        g = await ensureBoot(ctx);
-      } catch (e) {
-        // A failed boot must not poison the isolate: the next request tries
-        // again (it holds the lease, so only one boot runs at a time).
-        release();
-        return error(500, e);
-      }
-
-      // The timeout bounds time to first byte, not the body: a large download
-      // may take as long as its client needs. While the timeout's abort,
-      // recycle and replay run, a second timer keeps the runtime from
-      // declaring the request hung (no pending I/O is left once the first
-      // one fires).
-      const controller = new AbortController();
-      let timedOut = false;
-      const timer = setTimeout(() => {
-        timedOut = true;
-        keepalive = setTimeout(() => {}, 2 * GUEST_TIMEOUT_MS);
-        controller.abort();
-      }, GUEST_TIMEOUT_MS);
-      let released = false;
-      const releaseOnce = () => {
-        clearTimeout(timer);
-        if (released) return;
-        released = true;
-        release();
-      };
-
-      try {
-        const r = await g.vm.fetch(guestUrl, {
-          method: request.method,
-          headers,
-          body,
-          signal: AbortSignal.any([request.signal, controller.signal]),
-        }, {
-          head: () => {
-            ttfbAt = Date.now();
-            clearTimeout(timer);
-          },
-          finished: () => {
-            releaseOnce();
-            noteSlow("done");
-          },
-        });
-        stopKeepalive();
-        // A response body holds the lease until it ends (fetchOver calls
-        // finished); a body-less response is complete already.
-        // The timings let a client tell queueing from the guest and from the
-        // edge: both are milliseconds unless something is wrong.
-        const outHeaders = new Headers(r.headers);
-        outHeaders.set("x-unkernel-queue-ms", String(acquiredAt - queuedAt));
-        outHeaders.set("x-unkernel-ttfb-ms", String((ttfbAt || Date.now()) - acquiredAt));
-        const out = new Response(r.body, { status: r.status, statusText: r.statusText, headers: outHeaders });
-        if (!out.body) releaseOnce();
-        return out;
-      } catch (e) {
-        releaseOnce();
-        noteSlow("error");
-        // The guest stopped answering (a lost wakeup in the kernel/engine
-        // pairing): replace the VM and replay once on the fresh one.
-        if (!timedOut || request.signal.aborted || attempt > 0) {
-          stopKeepalive();
-          return error(502, e);
+    queue.push(job);
+    // A client that goes away must not leave a dead head blocking the queue.
+    job.signal.addEventListener(
+      "abort",
+      () => {
+        const i = queue.indexOf(job);
+        if (i >= 0) queue.splice(i, 1);
+        if (!job.done) {
+          job.error = new Error("client disconnected");
+          job.done = true;
         }
-        // The keepalive timer stays armed through the recycle and replay (it
-        // is what keeps the runtime from abandoning the replay); the retry's
-        // success or terminal error clears it.
-        const s = g.vm.debug() as Record<string, unknown>;
-        console.error("[unkernel-rs] guest timeout " + JSON.stringify({
-          idle: s.idle, irqs: s.irqs, stats: s.stats,
-          queued: (s.vsockDevice as { queued?: number } | undefined)?.queued,
-          conns: (s.vsock as { connections?: Array<Record<string, unknown>> } | undefined)?.connections
-            ?.map((c) => ({ k: c.key, s: c.state, rx: c.rx, tx: c.tx, want: c.wantRead, shut: c.shutSent, peer: c.peerShutSend })),
-        }));
-        recycle(g, `no response within ${GUEST_TIMEOUT_MS} ms`);
+      },
+      { once: true },
+    );
+
+    for (let polls = 0; ; polls++) {
+      if (job.done) break;
+      const atHead = queue[0] === job;
+      if (atHead && leaseOwner === null) {
+        await driveTurn(job, ctx);
+        continue;
       }
+      // The next driver checks at once (the VM is idle or about to be); the
+      // ones behind it back off so a deep queue does not spin timers.
+      await new Promise<void>((r) => setTimeout(r, atHead ? 0 : pollDelay(polls)));
     }
+    return respond(job);
   },
 };
+
+/** Turn one job's result into the client's Response. */
+function respond(job: Job): Response {
+  const r = job.result;
+  if (!r || job.error) return error(502, job.error ?? new Error("empty response"));
+
+  const headers = new Headers(r.headers);
+  headers.set("x-unkernel-queue-ms", String(r.queueMs));
+  headers.set("x-unkernel-ttfb-ms", String(r.ttfbMs));
+  headers.set("x-unkernel-batch", String(r.batch));
+
+  if (r.stream) {
+    // A streamed body keeps the VM until it ends (driveTurn's trace).
+    return new Response(r.stream, { status: r.status, statusText: r.statusText, headers });
+  }
+  headers.delete("transfer-encoding");
+  if (job.method === "HEAD") {
+    // Keep the guest's Content-Length: it describes the body we did not read.
+  } else if (r.status === 204 || r.status === 205) {
+    headers.delete("content-length");
+  } else {
+    headers.set("content-length", String(r.bytes?.byteLength ?? 0));
+  }
+  const body = r.bytes && r.bytes.byteLength ? r.bytes : null;
+  return new Response(body, { status: r.status, statusText: r.statusText, headers });
+}
 
 function error(status: number, e: unknown): Response {
   const message = e instanceof Error ? e.message : String(e);
