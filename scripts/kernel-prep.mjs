@@ -9,35 +9,30 @@
  *      table, ~250 KB of names that make thousands of functions look live);
  *      see EXPORTS;
  *   3. pack the guest binary into the initrd as <guest-path>, recompressed
- *      with gzip -9, so the Worker has no 9p mount (and no data module);
+ *      with gzip -9 or zstd -19, so the Worker has no 9p mount (and no data
+ *      module);
  *
  * then run wasm-opt -Oz --closed-world --remove-unused-module-elements, which
  * can delete the functions the dropped exports kept alive.
  *
- *   node scripts/kernel-prep.mjs --in KERNEL.wasm --out KERNEL.wasm --binary BIN --guest-path /hello/axum-hello
+ *   node scripts/kernel-prep.mjs --in KERNEL.wasm --out KERNEL.wasm --binary BIN --guest-path /hello/axum-hello [--initrd-compression gzip|zstd]
  *
  * Everything here is the same module, byte for byte reproducible: the initrd
  * entries are copied verbatim, the new ones appended before the trailer.
  */
 import { readFileSync, writeFileSync } from "node:fs";
-import { gunzipSync, gzipSync } from "node:zlib";
+import { spawnSync } from "node:child_process";
+import * as zlib from "node:zlib";
 
 /**
- * The exports the SDK reads: Kernel.boot() (globals, entry), JitHost.attach
- * (the function table; the JIT stays off, but attach reads it), the SMP entry
- * points (a one-CPU boot never calls them, kept as the module's API says) and
- * nothing else. Removing the other ~11k is what lets the DCE pass run.
+ * The exports the specialized UP SDK reads: Kernel.boot() uses the entry,
+ * fork return, IRQ global, banner and kernel end. Constructors and the
+ * indirect table remain internal where the start/element sections need them.
+ * Removing the other ~11k symbol-table exports is what lets DCE run.
  */
 const EXPORTS = new Set([
-  "__indirect_function_table",
-  "__stack_pointer",
-  "__wasm_call_ctors",
-  "__wasm_init_memory_flag",
   "_end",
   "_start",
-  "kw_resume",
-  "kw_secondary_entry",
-  "kw_secondary_resume",
   "linux_banner",
   "ret_from_fork",
   "wasm_host_irqs",
@@ -60,6 +55,8 @@ const outPath = arg("out");
 const binPath = arg("binary");
 const guestPath = arg("guest-path", "/hello/axum-hello").replace(/^\/+/, "");
 const minimal = argv.includes("--minimal-initrd");
+const initrdCompression = arg("initrd-compression", "gzip").toLowerCase();
+const initrdLevel = Number(arg("initrd-level", "19"));
 
 /** --add GUEST=HOST / --add-from-initrd GUEST=PATH, in order. */
 function specs(name) {
@@ -79,7 +76,7 @@ function specs(name) {
 const add = specs("add");
 const addFromInitrd = specs("add-from-initrd");
 if (!inPath || !outPath || !binPath) {
-  console.error("usage: kernel-prep.mjs --in KERNEL.wasm --out KERNEL.wasm --binary BIN [--guest-path /hello/axum-hello]");
+  console.error("usage: kernel-prep.mjs --in KERNEL.wasm --out KERNEL.wasm --binary BIN [--guest-path /hello/axum-hello] [--initrd-compression gzip|zstd]");
   process.exit(1);
 }
 
@@ -181,6 +178,28 @@ function addFile(entries, path, data) {
   entries.push(trailer);
 }
 
+// --- initrd compression -------------------------------------------------------
+
+function packInitrd(data) {
+  if (initrdCompression === "gzip") return zlib.gzipSync(data, { level: 9 });
+  if (initrdCompression !== "zstd") throw new Error("kernel-prep: unknown initrd compression " + initrdCompression);
+  if (!Number.isInteger(initrdLevel) || initrdLevel < 1 || initrdLevel > 22)
+    throw new Error("kernel-prep: zstd level must be an integer from 1 to 22");
+
+  // Node 26 has a built-in zstd encoder. The CLI fallback keeps the build
+  // usable on older Node versions; either produces a standard zstd frame.
+  if (typeof zlib.zstdCompressSync === "function") {
+    return zlib.zstdCompressSync(data, {
+      pledgedSrcSize: data.length,
+      params: { [zlib.constants.ZSTD_c_compressionLevel]: initrdLevel },
+    });
+  }
+  const packed = spawnSync("zstd", ["-q", "-" + initrdLevel, "-c"], { input: data, maxBuffer: 16 * 1024 * 1024 });
+  if (packed.error) throw new Error("kernel-prep: zstd is unavailable; install it or use Node 26+ (or --initrd-compression gzip)");
+  if (packed.status !== 0) throw new Error("kernel-prep: zstd failed: " + packed.stderr.toString().trim());
+  return packed.stdout;
+}
+
 // --- the module --------------------------------------------------------------
 
 const wasm = readFileSync(inPath);
@@ -198,7 +217,7 @@ for (const s of sections(wasm)) {
     if (name === "unkernel.initrd") {
       const nameLen = rawNameLength(wasm, s.payloadStart);
       const gz = wasm.subarray(s.payloadStart + nameLen, s.end);
-      const base = parseCpio(gunzipSync(gz));
+      const base = parseCpio(zlib.gunzipSync(gz));
       // --minimal-initrd keeps only the trailer and what is added below.
       const entries = minimal ? [base[base.length - 1]] : base.slice();
       addFile(entries, guestPath, binary);
@@ -209,10 +228,10 @@ for (const s of sections(wasm)) {
         if (!found) throw new Error("initrd: " + a.source + " is not a file in the base image");
         addFile(entries, a.guest, found.data);
       }
-      const packed = gzipSync(emitCpio(entries), { level: 9 });
+      const packed = packInitrd(emitCpio(entries));
       const payload = Buffer.concat([wasm.subarray(s.payloadStart, s.payloadStart + nameLen), packed]);
       out.push(Buffer.from([0]), leb(payload.length), payload);
-      console.log("kernel-prep: initrd " + gz.length + " -> " + packed.length + " bytes (" + (minimal ? "minimal" : "base") + " image)");
+      console.log("kernel-prep: initrd " + gz.length + " -> " + packed.length + " bytes (" + initrdCompression + ", " + (minimal ? "minimal" : "base") + " image)");
       continue;
     }
     out.push(raw);

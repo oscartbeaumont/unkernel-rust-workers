@@ -1,14 +1,19 @@
 {
   "name": "unkernel-rust-workers",
   "version": "0.1.0",
-  "description": "A Rust + Axum hello world in Cloudflare Workers, running inside a Linux kernel compiled to WebAssembly (unkernel)",
+  "description": "A Rust + Axum guest running unkernel Linux in Cloudflare Workers, with CPU jobs sharded across Durable Objects",
   "type": "module",
   "private": true,
   "scripts": {
     "assets": "./build.sh",
+    "assets:worker": "./build.sh",
     "build": "npm run assets && cf build",
     "dev": "cf dev",
     "deploy": "npm run assets && cf deploy",
+    "bench": "node scripts/bench.mjs",
+    "bench:cpu": "node scripts/bench-cpu.mjs",
+    "stress": "node scripts/stress.mjs",
+    "test": "node scripts/test.mjs",
     "typecheck": "tsc --noEmit",
     "kernel": "kernel/build-kernel.sh"
   },
